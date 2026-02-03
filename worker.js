@@ -86,6 +86,34 @@ function emailLocalPart(v) {
   return txt;
 }
 
+function toIntString(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "0";
+  return String(Math.trunc(n));
+}
+
+function toDayMonth(v) {
+  const txt = s(v);
+  if (!txt) return "";
+
+  const d = new Date(txt);
+  if (Number.isNaN(d.getTime())) return "";
+
+  const day = d.getUTCDate();
+  const month = d.toLocaleString("en-GB", { month: "short", timeZone: "UTC" });
+
+  return String(day) + " " + month;
+}
+
+function hoursDecimalToHhMm(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return "0h 0m";
+  const totalMinutes = Math.round(n * 60);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return String(h) + "h " + String(m) + "m";
+}
+
 let shuttingDown = false;
 
 process.on("SIGTERM", () => {
@@ -133,6 +161,7 @@ async function withQueueRetry(fn) {
 
   while (true) {
     attempt += 1;
+
     const r = await fn();
     if (r.ok) return r;
 
@@ -158,7 +187,7 @@ async function respondCreateOrUpdate(token, phoneE164, firstName, profilePic, cu
   const url = urlWithPhone(base, phoneE164);
 
   const body = {
-    firstName: firstName,
+    firstName,
     phone: phoneE164,
     custom_fields: customFields
   };
@@ -202,7 +231,12 @@ async function respondDeleteTags(token, phoneE164, tags) {
   return { ok: true, status: 200, text: "", json: {} };
 }
 
-async function fetchWork(pool, limit) {
+const pool = new Pool({
+  connectionString: envRequired("DATABASE_URL"),
+  ssl: envOptional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
+});
+
+async function fetchWork(limit) {
   const client = await pool.connect();
   try {
     const q = `
@@ -216,7 +250,11 @@ async function fetchWork(pool, limit) {
         group_raw,
         manager_raw,
         tier_tag,
-        profile_pic_url
+        profile_pic_url,
+        stats_as_of,
+        diamonds_mtd,
+        valid_days_mtd,
+        live_duration_mtd_hours
       FROM v_respond_sync_users
       ORDER BY user_id
       LIMIT $1
@@ -242,19 +280,11 @@ async function main() {
     "RESPOND_IO_DELETE_CONTACT_URL=" + hasEnv("RESPOND_IO_DELETE_CONTACT_URL")
   );
 
-  const dbUrl = envRequired("DATABASE_URL");
-  const dbSsl = envOptional("DATABASE_SSL", "false") === "true";
-
   const token = envRequired("RESPOND_IO_TOKEN");
 
   const limit = Number(envOptional("SYNC_LIMIT", "800"));
   const paceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS", "600"));
   const tierUniverse = parseCsv(envOptional("TIER_TAGS_CSV", ""));
-
-  const pool = new Pool({
-    connectionString: dbUrl,
-    ssl: dbSsl ? { rejectUnauthorized: false } : undefined
-  });
 
   let total = 0;
   let ok = 0;
@@ -264,7 +294,7 @@ async function main() {
 
   log("Worker start", "limit=" + limit, "pace_ms=" + paceMs);
 
-  const rows = await fetchWork(pool, limit);
+  const rows = await fetchWork(limit);
   log("Fetched rows", "count=" + rows.length);
 
   for (const r of rows) {
@@ -306,6 +336,11 @@ async function main() {
       const groupValue = extractInsideParens(s(r.group_raw));
       const managerValue = emailLocalPart(s(r.manager_raw));
 
+      const diamondsMtd = toIntString(r.diamonds_mtd);
+      const validDaysMtd = toIntString(r.valid_days_mtd);
+      const liveDurationMtd = hoursDecimalToHhMm(r.live_duration_mtd_hours);
+      const statsAsOf = toDayMonth(r.stats_as_of);
+
       const firstName = tiktok ? tiktok : "user_" + String(userId);
 
       const customFields = [
@@ -314,7 +349,11 @@ async function main() {
         { name: "tiktok_username", value: tiktok || null },
         { name: "agency_status", value: agencyStatus || null },
         { name: "group", value: groupValue || null },
-        { name: "manager", value: managerValue || null }
+        { name: "manager", value: managerValue || null },
+        { name: "diamonds_mtd", value: diamondsMtd },
+        { name: "valid_days_mtd", value: validDaysMtd },
+        { name: "live_duration_mtd", value: liveDurationMtd },
+        { name: "stats_as_of", value: statsAsOf || null }
       ];
 
       const cu = await respondCreateOrUpdate(token, phone, firstName, s(r.profile_pic_url), customFields);
@@ -359,8 +398,10 @@ async function main() {
         "OK sync",
         "user_id=" + userId,
         "phone=" + phone,
-        "group=" + groupValue,
-        "manager=" + managerValue
+        "diamonds_mtd=" + diamondsMtd,
+        "valid_days_mtd=" + validDaysMtd,
+        "live_duration_mtd=" + liveDurationMtd,
+        "stats_as_of=" + statsAsOf
       );
     } catch (e) {
       fail += 1;
@@ -370,14 +411,7 @@ async function main() {
     await sleepMs(paceMs);
   }
 
-  log(
-    "Summary",
-    "total=" + total,
-    "ok=" + ok,
-    "fail=" + fail,
-    "synced=" + synced,
-    "deleted=" + deleted
-  );
+  log("Summary", "total=" + total, "ok=" + ok, "fail=" + fail, "synced=" + synced, "deleted=" + deleted);
 
   await pool.end();
   log("Worker completed");
