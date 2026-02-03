@@ -78,7 +78,7 @@ function buildUrl(templateEnvVar, phoneE164) {
   return baseUrl.replace("{identifier}", identifier);
 }
 
-async function createContactInRespond({ phoneE164, firstName, customFields }) {
+async function createContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
   const url = buildUrl("RESPOND_IO_CREATE_CONTACT_URL", phoneE164);
 
   const body = {
@@ -86,6 +86,10 @@ async function createContactInRespond({ phoneE164, firstName, customFields }) {
     phone: phoneE164,
     custom_fields: customFields
   };
+
+  if (isNonEmptyString(profilePicUrl)) {
+    body.profilePic = profilePicUrl.trim();
+  }
 
   return httpJson("POST", url, body);
 }
@@ -114,6 +118,7 @@ async function fetchJoiners(limit) {
         tiktok_username,
         creator_id,
         agency_status,
+        profile_pic_url,
         role_tag,
         group_tag,
         creator_network_manager_tag,
@@ -216,6 +221,7 @@ async function main() {
       const createResp = await createContactInRespond({
         phoneE164,
         firstName,
+        profilePicUrl: r.profile_pic_url,
         customFields
       });
 
@@ -243,7 +249,7 @@ async function main() {
 
       ok += 1;
       console.log(
-        `OK user_id=${userId} phone=${phoneE164} contact_id=${respondContactId} create=${JSON.stringify(createResp)} tags=${JSON.stringify(tagResp)}`
+        `OK user_id=${userId} phone=${phoneE164} contact_id=${respondContactId} profile_pic=${safeString(r.profile_pic_url)} create=${JSON.stringify(createResp)} tags=${JSON.stringify(tagResp)}`
       );
     } catch (e) {
       fail += 1;
