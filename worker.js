@@ -47,6 +47,41 @@ function parseCsvTags(v) {
   );
 }
 
+function extractBracketValue(s) {
+  const v = safeString(s);
+  if (!v) return "";
+
+  const open = v.indexOf("(");
+  const close = v.lastIndexOf(")");
+
+  if (open >= 0 && close > open) {
+    const inside = v.slice(open + 1, close).trim();
+    return inside || v;
+  }
+
+  return v;
+}
+
+function emailLocalPart(s) {
+  const v = safeString(s);
+  if (!v) return "";
+
+  const at = v.indexOf("@");
+  if (at > 0) return v.slice(0, at).trim() || v;
+
+  return v;
+}
+
+function normalizeGroupField(row) {
+  const raw = safeString(row.group_value) || safeString(row.group_tag) || "";
+  return extractBracketValue(raw);
+}
+
+function normalizeManagerField(row) {
+  const raw = safeString(row.manager_value) || safeString(row.creator_network_manager_tag) || "";
+  return emailLocalPart(raw);
+}
+
 let shuttingDown = false;
 
 process.on("SIGTERM", () => {
@@ -207,6 +242,8 @@ async function fetchWork(limit) {
         v.group_tag,
         v.creator_network_manager_tag,
         v.tier_tag,
+        v.group_value,
+        v.manager_value,
         ss.last_role_tag,
         ss.last_group_tag,
         ss.last_creator_network_manager_tag,
@@ -313,21 +350,11 @@ function desiredTagsFromRow(row) {
   ]);
 }
 
-function needsFieldUpdate(row, firstName, profilePicUrl) {
-  if (safeString(row.last_first_name) !== safeString(firstName)) return true;
-  if (safeString(row.last_profile_pic_url) !== safeString(profilePicUrl)) return true;
-  if (safeString(row.last_creator_id) !== safeString(row.creator_id)) return true;
-  if (safeString(row.last_tiktok_username) !== safeString(row.tiktok_username)) return true;
-  if (safeString(row.last_agency_status) !== safeString(row.agency_status)) return true;
-  return false;
-}
-
 async function main() {
   console.log("Worker start");
 
   const limit = Number(envOptional("SYNC_LIMIT") || "600");
   const perContactPaceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS") || "400");
-
   const tierTagUniverse = parseCsvTags(envOptional("TIER_TAGS_CSV"));
 
   let ok = 0;
@@ -377,11 +404,16 @@ async function main() {
       const firstName = safeString(r.tiktok_username) || `user_${userId}`;
       const profilePicUrl = safeString(r.profile_pic_url);
 
+      const groupFieldValue = normalizeGroupField(r);
+      const managerFieldValue = normalizeManagerField(r);
+
       const customFields = [
         { name: "neon_user_id", value: String(userId) },
-        { name: "creator_id", value: safeString(r.creator_id) },
-        { name: "tiktok_username", value: safeString(r.tiktok_username) },
-        { name: "agency_status", value: agencyStatus }
+        { name: "creator_id", value: safeString(r.creator_id) || null },
+        { name: "tiktok_username", value: safeString(r.tiktok_username) || null },
+        { name: "agency_status", value: agencyStatus || null },
+        { name: "Group", value: groupFieldValue || null },
+        { name: "Manager", value: managerFieldValue || null }
       ];
 
       const cu = await createOrUpdateContact({ phoneE164, firstName, profilePicUrl, customFields });
@@ -394,14 +426,11 @@ async function main() {
         await upsertRespondContacts(userId, phoneE164, contactId);
       }
 
-      const desiredTags = desiredTagsFromRow(r);
-
       const roleDesired = safeString(r.role_tag);
       const tierDesired = safeString(r.tier_tag);
 
       const legacyRoleTags = ["role_creator", "role_manager"];
       const roleUniverse = ["Creator", "Manager"];
-
       const roleToDelete = uniqueStrings(legacyRoleTags.concat(roleUniverse));
       const roleToAdd = roleDesired ? [roleDesired] : [];
 
@@ -431,10 +460,11 @@ async function main() {
         }
       }
 
+      const desiredTags = desiredTagsFromRow(r);
       const nonRoleNonTierDesired = desiredTags.filter((t) => {
         if (t === "Creator" || t === "Manager") return false;
         if (tierTagUniverse.includes(t)) return false;
-        if (t.startsWith("Tier:")) return false;
+        if (t.toLowerCase().startsWith("tier:")) return false;
         return true;
       });
 
@@ -444,8 +474,6 @@ async function main() {
           throw new Error(`Add tags failed HTTP ${addOther.status} ${addOther.text}`);
         }
       }
-
-      const fieldUpdateNeeded = needsFieldUpdate(r, firstName, profilePicUrl);
 
       await upsertRespondState(userId, {
         last_role_tag: roleDesired || null,
@@ -457,16 +485,15 @@ async function main() {
         last_first_name: firstName || null,
         last_creator_id: safeString(r.creator_id) || null,
         last_tiktok_username: safeString(r.tiktok_username) || null,
-        last_agency_status: agencyStatus
+        last_agency_status: agencyStatus || null
       });
 
       updated += 1;
       ok += 1;
 
-      const roleInfo = `role=${roleDesired || "none"}`;
-      const tierInfo = tierTagUniverse.length > 0 ? ` tier=${tierDesired || "none"}` : "";
-      const fieldsInfo = fieldUpdateNeeded ? " fields=checked" : " fields=checked";
-      console.log(`OK sync user_id=${userId} phone=${phoneE164} ${roleInfo}${tierInfo}${fieldsInfo}`);
+      console.log(
+        `OK sync user_id=${userId} phone=${phoneE164} group=${groupFieldValue} manager=${managerFieldValue}`
+      );
     } catch (e) {
       fail += 1;
       console.log(`FAIL user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
