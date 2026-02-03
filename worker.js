@@ -313,8 +313,8 @@ async function main() {
         { name: "creator_id", value: creatorId || null },
         { name: "tiktok_username", value: tiktok || null },
         { name: "agency_status", value: agencyStatus || null },
-        { name: "Group", value: groupValue || null },
-        { name: "Manager", value: managerValue || null }
+        { name: "group", value: groupValue || null },
+        { name: "manager", value: managerValue || null }
       ];
 
       const cu = await respondCreateOrUpdate(token, phone, firstName, s(r.profile_pic_url), customFields);
