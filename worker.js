@@ -78,9 +78,9 @@ async function http(method, url, body, acceptOverride) {
 }
 
 async function withQueueRetry(fn) {
-  const maxAttempts = Number(process.env.RESPOND_IO_RETRY_MAX || "6");
-  const baseDelayMs = Number(process.env.RESPOND_IO_RETRY_BASE_MS || "1500");
-  const maxDelayMs = Number(process.env.RESPOND_IO_RETRY_MAX_MS || "20000");
+  const maxAttempts = Number(process.env.RESPOND_IO_RETRY_MAX || "8");
+  const baseDelayMs = Number(process.env.RESPOND_IO_RETRY_BASE_MS || "2000");
+  const maxDelayMs = Number(process.env.RESPOND_IO_RETRY_MAX_MS || "30000");
 
   let attempt = 0;
   while (true) {
@@ -133,34 +133,23 @@ function contactIdFromJson(json) {
   return 0;
 }
 
-async function updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
-  const url = urlWithPhone("RESPOND_IO_UPDATE_CONTACT_URL", phoneE164);
+async function createOrUpdateContact({ phoneE164, firstName, profilePicUrl, customFields }) {
+  const url = urlWithPhone("RESPOND_IO_CREATE_OR_UPDATE_URL", phoneE164);
   const body = buildContactBody({ phoneE164, firstName, profilePicUrl, customFields });
 
   const res = await withQueueRetry(() =>
-    http("PUT", url, body, "application/json, application/xml, multipart/form-data")
+    http("POST", url, body, "application/json, application/xml, multipart/form-data")
   );
 
   return res;
 }
 
-async function createContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
-  const url = urlWithPhone("RESPOND_IO_CREATE_CONTACT_URL", phoneE164);
-  const body = buildContactBody({ phoneE164, firstName, profilePicUrl, customFields });
-
-  const res = await http("POST", url, body, "application/json");
-  return res;
-}
-
-async function addTagsInRespond({ phoneE164, tags }) {
+async function addTags({ phoneE164, tags }) {
   const url = urlWithPhone("RESPOND_IO_ADD_TAGS_URL", phoneE164);
-
   const payload = uniqueStrings(tags);
-  if (payload.length < 1) return { ok: true, status: 200, text: "", json: { contactId: 0 } };
 
-  if (payload.length > 10) {
-    return { ok: false, status: 400, text: `Too many tags: ${payload.length}`, json: null };
-  }
+  if (payload.length < 1) return { ok: true, status: 200, text: "", json: { contactId: 0 } };
+  if (payload.length > 10) return { ok: false, status: 400, text: `Too many tags: ${payload.length}`, json: null };
 
   const res = await withQueueRetry(() =>
     http("POST", url, payload, "application/json, application/xml, multipart/form-data")
@@ -169,67 +158,27 @@ async function addTagsInRespond({ phoneE164, tags }) {
   return res;
 }
 
-async function fetchJoiners(limit) {
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query(
-      `
-      SELECT
-        user_id,
-        phone_e164,
-        tiktok_username,
-        creator_id,
-        agency_status,
-        profile_pic_url,
-        role_tag,
-        group_tag,
-        creator_network_manager_tag,
-        tier_tag
-      FROM v_respond_sync_users
-      WHERE agency_status = 'in_agency'
-        AND user_id NOT IN (SELECT user_id FROM respond_contacts)
-      ORDER BY user_id
-      LIMIT $1
-      `,
-      [limit]
-    );
-    return rows;
-  } finally {
-    client.release();
-  }
+async function deleteTags({ phoneE164, tags }) {
+  const url = urlWithPhone("RESPOND_IO_DELETE_TAGS_URL", phoneE164);
+  const payload = uniqueStrings(tags);
+
+  if (payload.length < 1) return { ok: true, status: 200, text: "", json: { contactId: 0 } };
+  if (payload.length > 10) return { ok: false, status: 400, text: `Too many tags: ${payload.length}`, json: null };
+
+  const res = await withQueueRetry(() =>
+    http("DELETE", url, payload, "application/json, application/xml, multipart/form-data")
+  );
+
+  return res;
 }
 
-async function fetchProfilePicUpdates(limit) {
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query(
-      `
-      SELECT
-        v.user_id,
-        v.phone_e164,
-        v.tiktok_username,
-        v.creator_id,
-        v.agency_status,
-        v.profile_pic_url
-      FROM v_respond_sync_users v
-      JOIN respond_contacts rc ON rc.user_id = v.user_id
-      LEFT JOIN respond_sync_state ss ON ss.user_id = v.user_id
-      WHERE v.agency_status = 'in_agency'
-        AND v.profile_pic_url IS NOT NULL
-        AND v.profile_pic_url <> ''
-        AND COALESCE(ss.last_profile_pic_url, '') <> v.profile_pic_url
-      ORDER BY v.user_id
-      LIMIT $1
-      `,
-      [limit]
-    );
-    return rows;
-  } finally {
-    client.release();
-  }
+async function deleteContact({ phoneE164 }) {
+  const url = urlWithPhone("RESPOND_IO_DELETE_CONTACT_URL", phoneE164);
+  const res = await http("DELETE", url, undefined, "application/json");
+  return res;
 }
 
-async function fetchTagDriftUpdates(limit) {
+async function fetchWork(limit) {
   const client = await pool.connect();
   try {
     const { rows } = await client.query(
@@ -244,17 +193,20 @@ async function fetchTagDriftUpdates(limit) {
         v.role_tag,
         v.group_tag,
         v.creator_network_manager_tag,
-        v.tier_tag
+        v.tier_tag,
+        ss.last_role_tag,
+        ss.last_group_tag,
+        ss.last_creator_network_manager_tag,
+        ss.last_tier_tag,
+        ss.last_profile_pic_url,
+        ss.last_first_name,
+        ss.last_creator_id,
+        ss.last_tiktok_username,
+        ss.last_agency_status
       FROM v_respond_sync_users v
-      JOIN respond_contacts rc ON rc.user_id = v.user_id
       LEFT JOIN respond_sync_state ss ON ss.user_id = v.user_id
-      WHERE v.agency_status = 'in_agency'
-        AND (
-          COALESCE(ss.last_role_tag, '') <> COALESCE(v.role_tag, '')
-          OR COALESCE(ss.last_group_tag, '') <> COALESCE(v.group_tag, '')
-          OR COALESCE(ss.last_creator_network_manager_tag, '') <> COALESCE(v.creator_network_manager_tag, '')
-          OR COALESCE(ss.last_tier_tag, '') <> COALESCE(v.tier_tag, '')
-        )
+      WHERE v.phone_e164 IS NOT NULL
+        AND v.phone_e164 <> ''
       ORDER BY v.user_id
       LIMIT $1
       `,
@@ -266,11 +218,9 @@ async function fetchTagDriftUpdates(limit) {
   }
 }
 
-async function upsertMappingAndState({ userId, respondContactId, phoneE164, roleTag, groupTag, cnmTag, tierTag, profilePicUrl }) {
+async function upsertRespondContacts(userId, phoneE164, respondContactId) {
   const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-
     await client.query(
       `
       INSERT INTO respond_contacts (user_id, respond_contact_id, phone_e164, created_at, updated_at)
@@ -283,7 +233,14 @@ async function upsertMappingAndState({ userId, respondContactId, phoneE164, role
       `,
       [userId, Number(respondContactId || 0), phoneE164]
     );
+  } finally {
+    client.release();
+  }
+}
 
+async function upsertRespondState(userId, state) {
+  const client = await pool.connect();
+  try {
     await client.query(
       `
       INSERT INTO respond_sync_state (
@@ -294,245 +251,216 @@ async function upsertMappingAndState({ userId, respondContactId, phoneE164, role
         last_tier_tag,
         last_phone_e164,
         last_profile_pic_url,
+        last_first_name,
+        last_creator_id,
+        last_tiktok_username,
+        last_agency_status,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
       ON CONFLICT (user_id)
       DO UPDATE SET
-        last_role_tag = COALESCE(EXCLUDED.last_role_tag, respond_sync_state.last_role_tag),
-        last_group_tag = COALESCE(EXCLUDED.last_group_tag, respond_sync_state.last_group_tag),
-        last_creator_network_manager_tag = COALESCE(EXCLUDED.last_creator_network_manager_tag, respond_sync_state.last_creator_network_manager_tag),
-        last_tier_tag = COALESCE(EXCLUDED.last_tier_tag, respond_sync_state.last_tier_tag),
-        last_phone_e164 = COALESCE(EXCLUDED.last_phone_e164, respond_sync_state.last_phone_e164),
-        last_profile_pic_url = COALESCE(EXCLUDED.last_profile_pic_url, respond_sync_state.last_profile_pic_url),
+        last_role_tag = EXCLUDED.last_role_tag,
+        last_group_tag = EXCLUDED.last_group_tag,
+        last_creator_network_manager_tag = EXCLUDED.last_creator_network_manager_tag,
+        last_tier_tag = EXCLUDED.last_tier_tag,
+        last_phone_e164 = EXCLUDED.last_phone_e164,
+        last_profile_pic_url = EXCLUDED.last_profile_pic_url,
+        last_first_name = EXCLUDED.last_first_name,
+        last_creator_id = EXCLUDED.last_creator_id,
+        last_tiktok_username = EXCLUDED.last_tiktok_username,
+        last_agency_status = EXCLUDED.last_agency_status,
         updated_at = now()
       `,
       [
         userId,
-        roleTag ?? null,
-        groupTag ?? null,
-        cnmTag ?? null,
-        tierTag ?? null,
-        phoneE164 ?? null,
-        isNonEmptyString(profilePicUrl) ? profilePicUrl : null
+        state.last_role_tag,
+        state.last_group_tag,
+        state.last_creator_network_manager_tag,
+        state.last_tier_tag,
+        state.last_phone_e164,
+        state.last_profile_pic_url,
+        state.last_first_name,
+        state.last_creator_id,
+        state.last_tiktok_username,
+        state.last_agency_status
       ]
     );
-
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
   } finally {
     client.release();
   }
 }
 
-async function runJoiners() {
-  const limit = Number(process.env.SYNC_LIMIT || "50");
-  const delayAfterCreateMs = Number(process.env.RESPOND_IO_POST_CREATE_DELAY_MS || "900");
-  const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "250");
-
-  const joiners = await fetchJoiners(limit);
-
-  let ok = 0;
-  let fail = 0;
-
-  for (const r of joiners) {
-    if (shuttingDown) break;
-
-    const userId = r.user_id;
-    const phoneE164 = r.phone_e164;
-
-    const firstName = safeString(r.tiktok_username) || `user_${userId}`;
-    const profilePicUrl = safeString(r.profile_pic_url);
-
-    const customFields = [
-      { name: "neon_user_id", value: String(userId) },
-      { name: "creator_id", value: safeString(r.creator_id) },
-      { name: "tiktok_username", value: safeString(r.tiktok_username) },
-      { name: "agency_status", value: safeString(r.agency_status) }
-    ];
-
-    const roleTag = r.role_tag;
-    const groupTag = r.group_tag;
-    const cnmTag = r.creator_network_manager_tag;
-    const tierTag = r.tier_tag;
-
-    const tagsToAdd = [roleTag, groupTag, cnmTag, tierTag];
-
-    try {
-      const upd = await updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields });
-
-      if (!upd.ok) {
-        const cre = await createContactInRespond({ phoneE164, firstName, profilePicUrl, customFields });
-
-        const alreadyExists =
-          cre.status === 403 && isNonEmptyString(cre.text) && cre.text.includes("Contact already exist");
-
-        if (!cre.ok && !alreadyExists) {
-          throw new Error(`Create failed HTTP ${cre.status} ${cre.text}`);
-        }
-
-        await sleep(delayAfterCreateMs);
-      }
-
-      const tagRes = await addTagsInRespond({ phoneE164, tags: tagsToAdd });
-      if (!tagRes.ok) throw new Error(`Add tags failed HTTP ${tagRes.status} ${tagRes.text}`);
-
-      const contactId = contactIdFromJson(tagRes.json);
-
-      await upsertMappingAndState({
-        userId,
-        respondContactId: contactId,
-        phoneE164,
-        roleTag,
-        groupTag,
-        cnmTag,
-        tierTag,
-        profilePicUrl
-      });
-
-      ok += 1;
-      console.log(`OK joiner user_id=${userId} phone=${phoneE164} contact_id=${contactId}`);
-    } catch (e) {
-      fail += 1;
-      console.log(`FAIL joiner user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
-    }
-
-    await sleep(perContactPaceMs);
-  }
-
-  console.log(`Joiners finished processed=${joiners.length} ok=${ok} fail=${fail}`);
+function normalizeDesiredTags(row) {
+  return uniqueStrings([
+    safeString(row.role_tag),
+    safeString(row.group_tag),
+    safeString(row.creator_network_manager_tag),
+    safeString(row.tier_tag)
+  ]);
 }
 
-async function runProfilePicUpdates() {
-  const limit = Number(process.env.UPDATE_LIMIT || "200");
-  const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "250");
-
-  const updates = await fetchProfilePicUpdates(limit);
-
-  let ok = 0;
-  let fail = 0;
-
-  for (const r of updates) {
-    if (shuttingDown) break;
-
-    const userId = r.user_id;
-    const phoneE164 = r.phone_e164;
-
-    const firstName = safeString(r.tiktok_username) || `user_${userId}`;
-    const profilePicUrl = safeString(r.profile_pic_url);
-
-    const customFields = [
-      { name: "neon_user_id", value: String(userId) },
-      { name: "creator_id", value: safeString(r.creator_id) },
-      { name: "tiktok_username", value: safeString(r.tiktok_username) },
-      { name: "agency_status", value: safeString(r.agency_status) }
-    ];
-
-    try {
-      const upd = await updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields });
-
-      if (!upd.ok) {
-        throw new Error(`Update failed HTTP ${upd.status} ${upd.text}`);
-      }
-
-      await upsertMappingAndState({
-        userId,
-        respondContactId: 0,
-        phoneE164,
-        roleTag: null,
-        groupTag: null,
-        cnmTag: null,
-        tierTag: null,
-        profilePicUrl
-      });
-
-      ok += 1;
-      console.log(`OK profile_pic user_id=${userId} phone=${phoneE164}`);
-    } catch (e) {
-      fail += 1;
-      console.log(`FAIL profile_pic user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
-    }
-
-    await sleep(perContactPaceMs);
-  }
-
-  console.log(`Profile pic updates finished processed=${updates.length} ok=${ok} fail=${fail}`);
+function normalizeLastTags(row) {
+  return uniqueStrings([
+    safeString(row.last_role_tag),
+    safeString(row.last_group_tag),
+    safeString(row.last_creator_network_manager_tag),
+    safeString(row.last_tier_tag)
+  ]);
 }
 
-async function runTagDriftUpdates() {
-  const limit = Number(process.env.TAG_UPDATE_LIMIT || "200");
-  const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "250");
+function computeTagDiff(desired, last) {
+  const desiredSet = new Set(desired);
+  const lastSet = new Set(last);
 
-  const updates = await fetchTagDriftUpdates(limit);
-
-  let ok = 0;
-  let fail = 0;
-
-  for (const r of updates) {
-    if (shuttingDown) break;
-
-    const userId = r.user_id;
-    const phoneE164 = r.phone_e164;
-
-    const firstName = safeString(r.tiktok_username) || `user_${userId}`;
-    const profilePicUrl = safeString(r.profile_pic_url);
-
-    const customFields = [
-      { name: "neon_user_id", value: String(userId) },
-      { name: "creator_id", value: safeString(r.creator_id) },
-      { name: "tiktok_username", value: safeString(r.tiktok_username) },
-      { name: "agency_status", value: safeString(r.agency_status) }
-    ];
-
-    const roleTag = r.role_tag;
-    const groupTag = r.group_tag;
-    const cnmTag = r.creator_network_manager_tag;
-    const tierTag = r.tier_tag;
-
-    const tagsToAdd = [roleTag, groupTag, cnmTag, tierTag];
-
-    try {
-      const upd = await updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields });
-      if (!upd.ok) {
-        throw new Error(`Update failed HTTP ${upd.status} ${upd.text}`);
-      }
-
-      const tagRes = await addTagsInRespond({ phoneE164, tags: tagsToAdd });
-      if (!tagRes.ok) throw new Error(`Add tags failed HTTP ${tagRes.status} ${tagRes.text}`);
-
-      const contactId = contactIdFromJson(tagRes.json);
-
-      await upsertMappingAndState({
-        userId,
-        respondContactId: contactId,
-        phoneE164,
-        roleTag,
-        groupTag,
-        cnmTag,
-        tierTag,
-        profilePicUrl
-      });
-
-      ok += 1;
-      console.log(`OK tag_drift user_id=${userId} phone=${phoneE164}`);
-    } catch (e) {
-      fail += 1;
-      console.log(`FAIL tag_drift user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
-    }
-
-    await sleep(perContactPaceMs);
+  const toAdd = [];
+  for (const t of desired) {
+    if (!lastSet.has(t)) toAdd.push(t);
   }
 
-  console.log(`Tag drift updates finished processed=${updates.length} ok=${ok} fail=${fail}`);
+  const toRemove = [];
+  for (const t of last) {
+    if (!desiredSet.has(t)) toRemove.push(t);
+  }
+
+  return { toAdd, toRemove };
+}
+
+function needsFieldUpdate(row, firstName, profilePicUrl) {
+  if (safeString(row.last_first_name) !== safeString(firstName)) return true;
+  if (safeString(row.last_profile_pic_url) !== safeString(profilePicUrl)) return true;
+  if (safeString(row.last_creator_id) !== safeString(row.creator_id)) return true;
+  if (safeString(row.last_tiktok_username) !== safeString(row.tiktok_username)) return true;
+  if (safeString(row.last_agency_status) !== safeString(row.agency_status)) return true;
+  return false;
 }
 
 async function main() {
   console.log("Worker start");
-  await runJoiners();
-  if (!shuttingDown) await runProfilePicUpdates();
-  if (!shuttingDown) await runTagDriftUpdates();
+
+  const limit = Number(process.env.SYNC_LIMIT || "200");
+  const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "400");
+
+  const rows = await fetchWork(limit);
+
+  let ok = 0;
+  let fail = 0;
+  let deleted = 0;
+  let updated = 0;
+  let noChange = 0;
+
+  for (const r of rows) {
+    if (shuttingDown) break;
+
+    const userId = r.user_id;
+    const phoneE164 = r.phone_e164;
+
+    try {
+      const agencyStatus = safeString(r.agency_status);
+
+      if (agencyStatus === "left_agency") {
+        const del = await deleteContact({ phoneE164 });
+        if (!del.ok && del.status !== 400) {
+          throw new Error(`Delete contact failed HTTP ${del.status} ${del.text}`);
+        }
+
+        await upsertRespondState(userId, {
+          last_role_tag: null,
+          last_group_tag: null,
+          last_creator_network_manager_tag: null,
+          last_tier_tag: null,
+          last_phone_e164: phoneE164,
+          last_profile_pic_url: null,
+          last_first_name: null,
+          last_creator_id: null,
+          last_tiktok_username: null,
+          last_agency_status: agencyStatus
+        });
+
+        deleted += 1;
+        ok += 1;
+        console.log(`OK delete user_id=${userId} phone=${phoneE164}`);
+        await sleep(perContactPaceMs);
+        continue;
+      }
+
+      const firstName = safeString(r.tiktok_username) || `user_${userId}`;
+      const profilePicUrl = safeString(r.profile_pic_url);
+
+      const customFields = [
+        { name: "neon_user_id", value: String(userId) },
+        { name: "creator_id", value: safeString(r.creator_id) },
+        { name: "tiktok_username", value: safeString(r.tiktok_username) },
+        { name: "agency_status", value: agencyStatus }
+      ];
+
+      const desiredTags = normalizeDesiredTags(r);
+      const lastTags = normalizeLastTags(r);
+      const { toAdd, toRemove } = computeTagDiff(desiredTags, lastTags);
+
+      const fieldUpdateNeeded = needsFieldUpdate(r, firstName, profilePicUrl);
+      const tagUpdateNeeded = toAdd.length > 0 || toRemove.length > 0;
+
+      if (!fieldUpdateNeeded && !tagUpdateNeeded) {
+        noChange += 1;
+        console.log(`OK no_change user_id=${userId} phone=${phoneE164}`);
+        await sleep(perContactPaceMs);
+        continue;
+      }
+
+      const cu = await createOrUpdateContact({ phoneE164, firstName, profilePicUrl, customFields });
+      if (!cu.ok) {
+        throw new Error(`Create or update failed HTTP ${cu.status} ${cu.text}`);
+      }
+
+      const contactId = contactIdFromJson(cu.json);
+      if (contactId) {
+        await upsertRespondContacts(userId, phoneE164, contactId);
+      }
+
+      if (toRemove.length > 0) {
+        const delTags = await deleteTags({ phoneE164, tags: toRemove });
+        if (!delTags.ok) {
+          throw new Error(`Delete tags failed HTTP ${delTags.status} ${delTags.text}`);
+        }
+      }
+
+      if (toAdd.length > 0) {
+        const add = await addTags({ phoneE164, tags: toAdd });
+        if (!add.ok) {
+          throw new Error(`Add tags failed HTTP ${add.status} ${add.text}`);
+        }
+      }
+
+      await upsertRespondState(userId, {
+        last_role_tag: desiredTags[0] || null,
+        last_group_tag: desiredTags[1] || null,
+        last_creator_network_manager_tag: desiredTags[2] || null,
+        last_tier_tag: desiredTags[3] || null,
+        last_phone_e164: phoneE164,
+        last_profile_pic_url: profilePicUrl || null,
+        last_first_name: firstName || null,
+        last_creator_id: safeString(r.creator_id) || null,
+        last_tiktok_username: safeString(r.tiktok_username) || null,
+        last_agency_status: agencyStatus
+      });
+
+      updated += 1;
+      ok += 1;
+      console.log(
+        `OK update user_id=${userId} phone=${phoneE164} remove=${toRemove.length} add=${toAdd.length}`
+      );
+    } catch (e) {
+      fail += 1;
+      console.log(`FAIL user_id=${r.user_id} phone=${r.phone_e164} err=${String(e.message || e)}`);
+    }
+
+    await sleep(perContactPaceMs);
+  }
+
+  console.log(
+    `Summary total=${rows.length} ok=${ok} fail=${fail} updated=${updated} deleted=${deleted} no_change=${noChange}`
+  );
 
   await pool.end();
 
