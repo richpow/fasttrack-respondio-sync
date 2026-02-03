@@ -38,12 +38,12 @@ let shuttingDown = false;
 
 process.on("SIGTERM", () => {
   shuttingDown = true;
-  console.log("SIGTERM received, stopping after current item");
+  console.log("SIGTERM received, will stop after current item");
 });
 
 process.on("SIGINT", () => {
   shuttingDown = true;
-  console.log("SIGINT received, stopping after current item");
+  console.log("SIGINT received, will stop after current item");
 });
 
 const pool = new Pool({
@@ -77,15 +77,14 @@ async function http(method, url, body, acceptOverride) {
   return { ok: res.ok, status: res.status, text, json };
 }
 
-async function withRetry(fn, opts) {
-  const maxAttempts = opts.maxAttempts;
-  const baseDelayMs = opts.baseDelayMs;
-  const maxDelayMs = opts.maxDelayMs;
+async function withQueueRetry(fn) {
+  const maxAttempts = Number(process.env.RESPOND_IO_RETRY_MAX || "6");
+  const baseDelayMs = Number(process.env.RESPOND_IO_RETRY_BASE_MS || "1500");
+  const maxDelayMs = Number(process.env.RESPOND_IO_RETRY_MAX_MS || "20000");
 
   let attempt = 0;
   while (true) {
     attempt += 1;
-
     const res = await fn();
 
     if (res.ok) return res;
@@ -95,19 +94,21 @@ async function withRetry(fn, opts) {
       isNonEmptyString(res.text) &&
       res.text.includes("in the queue");
 
-    if (!isQueue || attempt >= maxAttempts) return res;
+    if (!isQueue) return res;
+    if (attempt >= maxAttempts) return res;
 
     const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
-    console.log(`Queue response 449, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
+    console.log(`HTTP 449 queue, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
     await sleep(delay);
 
     if (shuttingDown) return res;
   }
 }
 
-function urlWithPhone(templateUrl, phoneE164) {
+function urlWithPhone(templateEnvVar, phoneE164) {
+  const base = env(templateEnvVar);
   const identifier = `phone:${phoneE164}`;
-  return templateUrl.replace("{identifier}", identifier);
+  return base.replace("{identifier}", identifier);
 }
 
 function buildContactBody({ phoneE164, firstName, profilePicUrl, customFields }) {
@@ -124,28 +125,27 @@ function buildContactBody({ phoneE164, firstName, profilePicUrl, customFields })
   return body;
 }
 
-async function updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
-  const template = env("RESPOND_IO_UPDATE_CONTACT_URL");
-  const url = urlWithPhone(template, phoneE164);
+function contactIdFromJson(json) {
+  if (!json) return 0;
+  const v = json.contactId;
+  if (typeof v === "number") return v;
+  if (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))) return Number(v);
+  return 0;
+}
 
+async function updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
+  const url = urlWithPhone("RESPOND_IO_UPDATE_CONTACT_URL", phoneE164);
   const body = buildContactBody({ phoneE164, firstName, profilePicUrl, customFields });
 
-  const res = await withRetry(
-    () => http("PUT", url, body, "application/json, application/xml, multipart/form-data"),
-    {
-      maxAttempts: Number(process.env.RESPOND_IO_RETRY_MAX || "6"),
-      baseDelayMs: Number(process.env.RESPOND_IO_RETRY_BASE_MS || "1500"),
-      maxDelayMs: Number(process.env.RESPOND_IO_RETRY_MAX_MS || "20000")
-    }
+  const res = await withQueueRetry(() =>
+    http("PUT", url, body, "application/json, application/xml, multipart/form-data")
   );
 
   return res;
 }
 
 async function createContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
-  const template = env("RESPOND_IO_CREATE_CONTACT_URL");
-  const url = urlWithPhone(template, phoneE164);
-
+  const url = urlWithPhone("RESPOND_IO_CREATE_CONTACT_URL", phoneE164);
   const body = buildContactBody({ phoneE164, firstName, profilePicUrl, customFields });
 
   const res = await http("POST", url, body, "application/json");
@@ -153,8 +153,7 @@ async function createContactInRespond({ phoneE164, firstName, profilePicUrl, cus
 }
 
 async function addTagsInRespond({ phoneE164, tags }) {
-  const template = env("RESPOND_IO_ADD_TAGS_URL");
-  const url = urlWithPhone(template, phoneE164);
+  const url = urlWithPhone("RESPOND_IO_ADD_TAGS_URL", phoneE164);
 
   const payload = uniqueStrings(tags);
   if (payload.length < 1) return { ok: true, status: 200, text: "", json: { contactId: 0 } };
@@ -163,13 +162,8 @@ async function addTagsInRespond({ phoneE164, tags }) {
     return { ok: false, status: 400, text: `Too many tags: ${payload.length}`, json: null };
   }
 
-  const res = await withRetry(
-    () => http("POST", url, payload, "application/json, application/xml, multipart/form-data"),
-    {
-      maxAttempts: Number(process.env.RESPOND_IO_RETRY_MAX || "6"),
-      baseDelayMs: Number(process.env.RESPOND_IO_RETRY_BASE_MS || "1500"),
-      maxDelayMs: Number(process.env.RESPOND_IO_RETRY_MAX_MS || "20000")
-    }
+  const res = await withQueueRetry(() =>
+    http("POST", url, payload, "application/json, application/xml, multipart/form-data")
   );
 
   return res;
@@ -240,32 +234,18 @@ async function upsertMappingAndState({ userId, respondContactId, phoneE164, role
   try {
     await client.query("BEGIN");
 
-    if (respondContactId !== null && respondContactId !== undefined) {
-      await client.query(
-        `
-        INSERT INTO respond_contacts (user_id, respond_contact_id, phone_e164, created_at, updated_at)
-        VALUES ($1, $2, $3, now(), now())
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-          respond_contact_id = EXCLUDED.respond_contact_id,
-          phone_e164 = EXCLUDED.phone_e164,
-          updated_at = now()
-        `,
-        [userId, respondContactId, phoneE164]
-      );
-    } else {
-      await client.query(
-        `
-        INSERT INTO respond_contacts (user_id, respond_contact_id, phone_e164, created_at, updated_at)
-        VALUES ($1, 0, $2, now(), now())
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-          phone_e164 = EXCLUDED.phone_e164,
-          updated_at = now()
-        `,
-        [userId, phoneE164]
-      );
-    }
+    await client.query(
+      `
+      INSERT INTO respond_contacts (user_id, respond_contact_id, phone_e164, created_at, updated_at)
+      VALUES ($1, $2, $3, now(), now())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        respond_contact_id = EXCLUDED.respond_contact_id,
+        phone_e164 = EXCLUDED.phone_e164,
+        updated_at = now()
+      `,
+      [userId, Number(respondContactId || 0), phoneE164]
+    );
 
     await client.query(
       `
@@ -310,17 +290,9 @@ async function upsertMappingAndState({ userId, respondContactId, phoneE164, role
   }
 }
 
-function contactIdFromTagResponse(res) {
-  if (!res || !res.json) return 0;
-  const v = res.json.contactId;
-  if (typeof v === "number") return v;
-  if (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))) return Number(v);
-  return 0;
-}
-
 async function runJoiners() {
   const limit = Number(process.env.SYNC_LIMIT || "50");
-  const delayMs = Number(process.env.RESPOND_IO_POST_CREATE_DELAY_MS || "900");
+  const delayAfterCreateMs = Number(process.env.RESPOND_IO_POST_CREATE_DELAY_MS || "900");
   const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "250");
 
   const joiners = await fetchJoiners(limit);
@@ -364,13 +336,13 @@ async function runJoiners() {
           throw new Error(`Create failed HTTP ${cre.status} ${cre.text}`);
         }
 
-        await sleep(delayMs);
+        await sleep(delayAfterCreateMs);
       }
 
       const tagRes = await addTagsInRespond({ phoneE164, tags: tagsToAdd });
       if (!tagRes.ok) throw new Error(`Add tags failed HTTP ${tagRes.status} ${tagRes.text}`);
 
-      const contactId = contactIdFromTagResponse(tagRes);
+      const contactId = contactIdFromJson(tagRes.json);
 
       await upsertMappingAndState({
         userId,
@@ -393,7 +365,7 @@ async function runJoiners() {
     await sleep(perContactPaceMs);
   }
 
-  console.log(`Joiners done processed=${joiners.length} ok=${ok} fail=${fail}`);
+  console.log(`Joiners finished processed=${joiners.length} ok=${ok} fail=${fail}`);
 }
 
 async function runProfilePicUpdates() {
@@ -430,7 +402,7 @@ async function runProfilePicUpdates() {
 
       await upsertMappingAndState({
         userId,
-        respondContactId: null,
+        respondContactId: 0,
         phoneE164,
         roleTag: null,
         groupTag: null,
@@ -449,19 +421,21 @@ async function runProfilePicUpdates() {
     await sleep(perContactPaceMs);
   }
 
-  console.log(`Profile pic updates done processed=${updates.length} ok=${ok} fail=${fail}`);
+  console.log(`Profile pic updates finished processed=${updates.length} ok=${ok} fail=${fail}`);
 }
 
 async function main() {
+  console.log("Worker start");
   await runJoiners();
   if (!shuttingDown) await runProfilePicUpdates();
 
   await pool.end();
 
   if (shuttingDown) {
-    console.log("Exiting cleanly after shutdown signal");
+    console.log("Worker exit clean after shutdown signal");
     process.exitCode = 0;
-    return;
+  } else {
+    console.log("Worker completed");
   }
 }
 
