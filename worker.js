@@ -13,17 +13,8 @@ function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
 
-function uniqueStrings(arr) {
-  const out = [];
-  const seen = new Set();
-  for (const x of arr) {
-    if (!isNonEmptyString(x)) continue;
-    const v = x.trim();
-    if (seen.has(v)) continue;
-    seen.add(v);
-    out.push(v);
-  }
-  return out;
+function safeString(v) {
+  return isNonEmptyString(v) ? v.trim() : "";
 }
 
 const pool = new Pool({
@@ -33,6 +24,7 @@ const pool = new Pool({
 
 function respondHeaders() {
   return {
+    Accept: "application/json",
     Authorization: `Bearer ${env("RESPOND_IO_TOKEN")}`,
     "Content-Type": "application/json"
   };
@@ -44,6 +36,7 @@ async function httpJson(method, url, body) {
     headers: respondHeaders(),
     body: body ? JSON.stringify(body) : undefined
   });
+
   const text = await res.text();
   let json = null;
   try {
@@ -51,91 +44,30 @@ async function httpJson(method, url, body) {
   } catch {
     json = null;
   }
+
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} ${text}`);
   }
+
   return json;
 }
 
-function extractContactId(payload) {
-  if (!payload) return null;
-  if (payload.id !== undefined && payload.id !== null) return payload.id;
-  if (payload.data && payload.data.id !== undefined && payload.data.id !== null) return payload.data.id;
-  if (payload.contact && payload.contact.id !== undefined && payload.contact.id !== null) return payload.contact.id;
-  return null;
+function buildCreateContactUrl(phoneE164) {
+  const baseUrl = env("RESPOND_IO_CREATE_CONTACT_URL");
+  const identifier = `phone:${phoneE164}`;
+  return baseUrl.replace("{identifier}", identifier);
 }
 
-async function createOrUpsertContact({ phoneE164, name, fields }) {
-  const url = env("RESPOND_IO_CREATE_CONTACT_URL");
+async function createContactInRespond({ phoneE164, firstName, customFields }) {
+  const url = buildCreateContactUrl(phoneE164);
+
   const body = {
-    identifier: `phone:${phoneE164}`,
-    name,
-    custom_fields: fields
+    firstName,
+    phone: phoneE164,
+    custom_fields: customFields
   };
-  const json = await httpJson("POST", url, body);
-  const contactId = extractContactId(json);
-  if (!contactId) throw new Error("Create contact succeeded but no contact id found in response");
-  return contactId;
-}
 
-async function addTags({ phoneE164, tags }) {
-  const url = env("RESPOND_IO_ADD_TAGS_URL");
-  const body = {
-    identifier: `phone:${phoneE164}`,
-    tags: uniqueStrings(tags)
-  };
-  await httpJson("POST", url, body);
-}
-
-async function upsertNeonMapping({ userId, respondContactId, phoneE164, roleTag, groupTag, cnmTag, tierTag }) {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    await client.query(
-      `
-      INSERT INTO respond_contacts (user_id, respond_contact_id, phone_e164, created_at, updated_at)
-      VALUES ($1, $2, $3, now(), now())
-      ON CONFLICT (user_id)
-      DO UPDATE SET
-        respond_contact_id = EXCLUDED.respond_contact_id,
-        phone_e164 = EXCLUDED.phone_e164,
-        updated_at = now()
-      `,
-      [userId, respondContactId, phoneE164]
-    );
-
-    await client.query(
-      `
-      INSERT INTO respond_sync_state (
-        user_id,
-        last_role_tag,
-        last_group_tag,
-        last_creator_network_manager_tag,
-        last_tier_tag,
-        last_phone_e164,
-        updated_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, now())
-      ON CONFLICT (user_id)
-      DO UPDATE SET
-        last_role_tag = EXCLUDED.last_role_tag,
-        last_group_tag = EXCLUDED.last_group_tag,
-        last_creator_network_manager_tag = EXCLUDED.last_creator_network_manager_tag,
-        last_tier_tag = EXCLUDED.last_tier_tag,
-        last_phone_e164 = EXCLUDED.last_phone_e164,
-        updated_at = now()
-      `,
-      [userId, roleTag, groupTag, cnmTag, tierTag, phoneE164]
-    );
-
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  return httpJson("POST", url, body);
 }
 
 async function fetchJoiners(limit) {
@@ -148,11 +80,7 @@ async function fetchJoiners(limit) {
         phone_e164,
         tiktok_username,
         creator_id,
-        agency_status,
-        role_tag,
-        group_tag,
-        creator_network_manager_tag,
-        tier_tag
+        agency_status
       FROM v_respond_sync_users
       WHERE agency_status = 'in_agency'
         AND user_id NOT IN (SELECT user_id FROM respond_contacts)
@@ -175,42 +103,30 @@ async function main() {
   let fail = 0;
 
   for (const r of joiners) {
-    const phoneE164 = r.phone_e164;
     const userId = r.user_id;
+    const phoneE164 = r.phone_e164;
 
-    const name = isNonEmptyString(r.tiktok_username) ? r.tiktok_username : `user_${userId}`;
+    const firstName = safeString(r.tiktok_username) || `user_${userId}`;
 
-    const fields = {
-      neon_user_id: String(userId),
-      creator_id: isNonEmptyString(r.creator_id) ? String(r.creator_id) : "",
-      tiktok_username: isNonEmptyString(r.tiktok_username) ? String(r.tiktok_username) : "",
-      agency_status: isNonEmptyString(r.agency_status) ? String(r.agency_status) : ""
-    };
-
-    const roleTag = r.role_tag;
-    const groupTag = r.group_tag;
-    const cnmTag = r.creator_network_manager_tag;
-    const tierTag = r.tier_tag;
+    const customFields = [
+      { name: "neon_user_id", value: String(userId) },
+      { name: "creator_id", value: safeString(r.creator_id) },
+      { name: "tiktok_username", value: safeString(r.tiktok_username) },
+      { name: "agency_status", value: safeString(r.agency_status) }
+    ];
 
     try {
-      const contactId = await createOrUpsertContact({ phoneE164, name, fields });
-      await addTags({ phoneE164, tags: [roleTag, groupTag, cnmTag, tierTag] });
-
-      await upsertNeonMapping({
-        userId,
-        respondContactId: contactId,
+      const resp = await createContactInRespond({
         phoneE164,
-        roleTag,
-        groupTag,
-        cnmTag,
-        tierTag
+        firstName,
+        customFields
       });
 
       ok += 1;
-      console.log(`OK user_id=${userId} phone=${phoneE164} contact_id=${contactId}`);
+      console.log(`OK created contact user_id=${userId} phone=${phoneE164} resp=${JSON.stringify(resp)}`);
     } catch (e) {
       fail += 1;
-      console.log(`FAIL user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
+      console.log(`FAIL create contact user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
     }
   }
 
