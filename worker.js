@@ -2,27 +2,39 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-function env_required(name) {
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function log(...args) {
+  console.log(nowIso(), ...args);
+}
+
+function envRequired(name) {
   const v = process.env[name];
   if (!v) throw new Error("Missing env var: " + name);
   return String(v);
 }
 
-function env_optional(name, fallback_value) {
+function envOptional(name, fallback) {
   const v = process.env[name];
-  if (v === undefined || v === null) return fallback_value;
+  if (v === undefined || v === null) return fallback;
   return String(v);
 }
 
-function is_non_empty_string(v) {
+function hasEnv(name) {
+  return Boolean(process.env[name] && String(process.env[name]).trim().length > 0);
+}
+
+function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
 
 function s(v) {
-  return is_non_empty_string(v) ? v.trim() : "";
+  return isNonEmptyString(v) ? v.trim() : "";
 }
 
-function sleep_ms(ms) {
+function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -39,71 +51,65 @@ function uniq(arr) {
   return out;
 }
 
-function split_csv(v) {
-  const txt = s(v);
-  if (!txt) return [];
-  return uniq(txt.split(",").map((x) => s(x)).filter((x) => x.length > 0));
-}
-
-function chunk_10(arr) {
+function chunk10(arr) {
   const out = [];
   for (let i = 0; i < arr.length; i += 10) out.push(arr.slice(i, i + 10));
   return out;
 }
 
-function extract_inside_parens(v) {
+function parseCsv(v) {
+  const txt = s(v);
+  if (!txt) return [];
+  return uniq(txt.split(",").map((x) => s(x)).filter((x) => x.length > 0));
+}
+
+function extractInsideParens(v) {
   const txt = s(v);
   if (!txt) return "";
-  const open_i = txt.indexOf("(");
-  const close_i = txt.lastIndexOf(")");
-  if (open_i >= 0 && close_i > open_i) {
-    const inside = txt.slice(open_i + 1, close_i).trim();
+  const open = txt.indexOf("(");
+  const close = txt.lastIndexOf(")");
+  if (open >= 0 && close > open) {
+    const inside = txt.slice(open + 1, close).trim();
     return inside || txt;
   }
   return txt;
 }
 
-function email_local_part(v) {
+function emailLocalPart(v) {
   const txt = s(v);
   if (!txt) return "";
-  const at_i = txt.indexOf("@");
-  if (at_i > 0) {
-    const left = txt.slice(0, at_i).trim();
+  const at = txt.indexOf("@");
+  if (at > 0) {
+    const left = txt.slice(0, at).trim();
     return left || txt;
   }
   return txt;
 }
 
-const dash = String.fromCharCode(45);
-const accept_json = "application/json";
-const accept_multi = "application/json, application/xml, multipart/form" + dash + "data";
-const header_auth = "Authorization";
-const header_ct = "Content" + dash + "Type";
-
-let shutting_down = false;
+let shuttingDown = false;
 
 process.on("SIGTERM", () => {
-  shutting_down = true;
-  console.log("SIGTERM received");
+  shuttingDown = true;
+  log("SIGTERM received");
 });
 
 process.on("SIGINT", () => {
-  shutting_down = true;
-  console.log("SIGINT received");
+  shuttingDown = true;
+  log("SIGINT received");
 });
 
-function respond_headers(accept_value) {
-  const h = {};
-  h.Accept = accept_value || accept_json;
-  h[header_auth] = "Bearer " + env_required("RESPOND_IO_TOKEN");
-  h[header_ct] = accept_json;
-  return h;
+function respondHeaders(token) {
+  return {
+    Accept: "application/json, application/xml, multipart/form-data",
+    Authorization: "Bearer " + token,
+    "Content-Type": "application/json"
+  };
 }
 
-async function http_call(method, url, body, accept_value) {
+async function httpCall(method, url, token, body) {
   const res = await fetch(url, {
     method,
-    headers: respond_headers(accept_value),
+    headers: respondHeaders(token),
     body: body === undefined ? undefined : JSON.stringify(body)
   });
 
@@ -118,92 +124,85 @@ async function http_call(method, url, body, accept_value) {
   return { ok: res.ok, status: res.status, text, json };
 }
 
-async function with_queue_retry(fn) {
-  const max_attempts = Number(env_optional("RESPOND_IO_RETRY_MAX", "8"));
-  const base_delay_ms = Number(env_optional("RESPOND_IO_RETRY_BASE_MS", "2000"));
-  const max_delay_ms = Number(env_optional("RESPOND_IO_RETRY_MAX_MS", "30000"));
+async function withQueueRetry(fn) {
+  const maxAttempts = Number(envOptional("RESPOND_IO_RETRY_MAX", "8"));
+  const baseDelay = Number(envOptional("RESPOND_IO_RETRY_BASE_MS", "2000"));
+  const maxDelay = Number(envOptional("RESPOND_IO_RETRY_MAX_MS", "30000"));
 
   let attempt = 0;
 
   while (true) {
     attempt += 1;
-
     const r = await fn();
     if (r.ok) return r;
 
-    const is_queue =
-      r.status === 449 &&
-      is_non_empty_string(r.text) &&
-      r.text.includes("in the queue");
+    const isQueue = r.status === 449 && isNonEmptyString(r.text) && r.text.includes("in the queue");
+    if (!isQueue) return r;
+    if (attempt >= maxAttempts) return r;
 
-    if (!is_queue) return r;
-    if (attempt >= max_attempts) return r;
+    const delay = Math.min(maxDelay, baseDelay * Math.pow(2, attempt - 1));
+    log("HTTP 449 queue retry", "delay_ms=" + delay, "attempt=" + attempt + "/" + maxAttempts);
+    await sleepMs(delay);
 
-    const delay = Math.min(max_delay_ms, base_delay_ms * Math.pow(2, attempt - 1));
-    console.log("HTTP 449 queue, retry in ms: " + delay + ", attempt " + attempt + " of " + max_attempts);
-    await sleep_ms(delay);
-
-    if (shutting_down) return r;
+    if (shuttingDown) return r;
   }
 }
 
-function url_with_identifier(template_env, phone_e164) {
-  const base = env_required(template_env);
-  const identifier = "phone:" + phone_e164;
-  return base.replace("{identifier}", identifier);
+function urlWithPhone(template, phoneE164) {
+  const identifier = "phone:" + phoneE164;
+  return template.replace("{identifier}", identifier);
 }
 
-async function respond_create_or_update(phone_e164, first_name, profile_pic, custom_fields) {
-  const url = url_with_identifier("RESPOND_IO_CREATE_OR_UPDATE_URL", phone_e164);
+async function respondCreateOrUpdate(token, phoneE164, firstName, profilePic, customFields) {
+  const base = envRequired("RESPOND_IO_CREATE_OR_UPDATE_URL");
+  const url = urlWithPhone(base, phoneE164);
 
   const body = {
-    firstName: first_name,
-    phone: phone_e164,
-    custom_fields: custom_fields
+    firstName: firstName,
+    phone: phoneE164,
+    custom_fields: customFields
   };
 
-  if (s(profile_pic)) body.profilePic = s(profile_pic);
+  if (s(profilePic)) body.profilePic = s(profilePic);
 
-  return await with_queue_retry(() => http_call("POST", url, body, accept_multi));
+  return await withQueueRetry(() => httpCall("POST", url, token, body));
 }
 
-async function respond_delete_contact(phone_e164) {
-  const url = url_with_identifier("RESPOND_IO_DELETE_CONTACT_URL", phone_e164);
-  return await http_call("DELETE", url, undefined, accept_json);
+async function respondDeleteContact(token, phoneE164) {
+  const base = envRequired("RESPOND_IO_DELETE_CONTACT_URL");
+  const url = urlWithPhone(base, phoneE164);
+  return await httpCall("DELETE", url, token, undefined);
 }
 
-async function respond_add_tags(phone_e164, tags) {
-  const url = url_with_identifier("RESPOND_IO_ADD_TAGS_URL", phone_e164);
+async function respondAddTags(token, phoneE164, tags) {
+  const base = envRequired("RESPOND_IO_ADD_TAGS_URL");
+  const url = urlWithPhone(base, phoneE164);
+
   const payload = uniq(tags);
-
   if (payload.length === 0) return { ok: true, status: 200, text: "", json: {} };
 
-  for (const part of chunk_10(payload)) {
-    const r = await with_queue_retry(() => http_call("POST", url, part, accept_multi));
+  for (const part of chunk10(payload)) {
+    const r = await withQueueRetry(() => httpCall("POST", url, token, part));
     if (!r.ok) return r;
   }
   return { ok: true, status: 200, text: "", json: {} };
 }
 
-async function respond_delete_tags(phone_e164, tags) {
-  const url = url_with_identifier("RESPOND_IO_DELETE_TAGS_URL", phone_e164);
-  const payload = uniq(tags);
+async function respondDeleteTags(token, phoneE164, tags) {
+  const base = envRequired("RESPOND_IO_DELETE_TAGS_URL");
+  const url = urlWithPhone(base, phoneE164);
 
+  const payload = uniq(tags);
   if (payload.length === 0) return { ok: true, status: 200, text: "", json: {} };
 
-  for (const part of chunk_10(payload)) {
-    const r = await with_queue_retry(() => http_call("DELETE", url, part, accept_multi));
+  for (const part of chunk10(payload)) {
+    const r = await withQueueRetry(() => httpCall("DELETE", url, token, part));
     if (!r.ok) return r;
   }
   return { ok: true, status: 200, text: "", json: {} };
 }
 
-const pool = new Pool({
-  connectionString: env_required("DATABASE_URL"),
-  ssl: env_optional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
-});
-
-async function fetch_rows(limit) {
+async function fetchWork(pool, limit) {
   const client = await pool.connect();
   try {
     const q = `
@@ -230,12 +229,32 @@ async function fetch_rows(limit) {
 }
 
 async function main() {
-  console.log("BOOT worker.js");
-  console.log("Worker start");
+  log("BOOT worker.js reached");
 
-  const limit = Number(env_optional("SYNC_LIMIT", "800"));
-  const pace_ms = Number(env_optional("RESPOND_IO_PER_CONTACT_PACE_MS", "600"));
-  const tier_universe = split_csv(env_optional("TIER_TAGS_CSV", ""));
+  log(
+    "ENV presence",
+    "DATABASE_URL=" + hasEnv("DATABASE_URL"),
+    "DATABASE_SSL=" + hasEnv("DATABASE_SSL"),
+    "RESPOND_IO_TOKEN=" + hasEnv("RESPOND_IO_TOKEN"),
+    "RESPOND_IO_CREATE_OR_UPDATE_URL=" + hasEnv("RESPOND_IO_CREATE_OR_UPDATE_URL"),
+    "RESPOND_IO_ADD_TAGS_URL=" + hasEnv("RESPOND_IO_ADD_TAGS_URL"),
+    "RESPOND_IO_DELETE_TAGS_URL=" + hasEnv("RESPOND_IO_DELETE_TAGS_URL"),
+    "RESPOND_IO_DELETE_CONTACT_URL=" + hasEnv("RESPOND_IO_DELETE_CONTACT_URL")
+  );
+
+  const dbUrl = envRequired("DATABASE_URL");
+  const dbSsl = envOptional("DATABASE_SSL", "false") === "true";
+
+  const token = envRequired("RESPOND_IO_TOKEN");
+
+  const limit = Number(envOptional("SYNC_LIMIT", "800"));
+  const paceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS", "600"));
+  const tierUniverse = parseCsv(envOptional("TIER_TAGS_CSV", ""));
+
+  const pool = new Pool({
+    connectionString: dbUrl,
+    ssl: dbSsl ? { rejectUnauthorized: false } : undefined
+  });
 
   let total = 0;
   let ok = 0;
@@ -243,94 +262,90 @@ async function main() {
   let synced = 0;
   let deleted = 0;
 
-  const rows = await fetch_rows(limit);
+  log("Worker start", "limit=" + limit, "pace_ms=" + paceMs);
+
+  const rows = await fetchWork(pool, limit);
+  log("Fetched rows", "count=" + rows.length);
 
   for (const r of rows) {
-    if (shutting_down) break;
+    if (shuttingDown) break;
 
     total += 1;
 
-    const user_id = r.user_id;
-    const phone_e164 = s(r.phone_e164);
+    const userId = r.user_id;
+    const phone = s(r.phone_e164);
 
     try {
-      if (!phone_e164) {
+      if (!phone) {
         ok += 1;
         continue;
       }
 
-      const agency_status = s(r.agency_status);
+      const agencyStatus = s(r.agency_status);
 
-      if (agency_status === "left_agency") {
-        const del = await respond_delete_contact(phone_e164);
+      if (agencyStatus === "left_agency") {
+        const del = await respondDeleteContact(token, phone);
+        const treatMissingOk = del.status === 400 || del.status === 404;
 
-        const treat_missing_ok = del.status === 400 || del.status === 404;
-        if (!del.ok && !treat_missing_ok) {
+        if (!del.ok && !treatMissingOk) {
           throw new Error("Delete contact failed HTTP " + del.status + " " + del.text);
         }
 
         deleted += 1;
         ok += 1;
-        console.log("OK delete user_id=" + user_id + " phone=" + phone_e164);
-        await sleep_ms(pace_ms);
+        log("OK delete", "user_id=" + userId, "phone=" + phone);
+        await sleepMs(paceMs);
         continue;
       }
 
-      const tiktok_username = s(r.tiktok_username);
-      const creator_id = s(r.creator_id);
+      const tiktok = s(r.tiktok_username);
+      const creatorId = s(r.creator_id);
+      const roleTag = s(r.role_tag);
+      const tierTag = s(r.tier_tag);
 
-      const role_tag = s(r.role_tag);
-      const tier_tag = s(r.tier_tag);
+      const groupValue = extractInsideParens(s(r.group_raw));
+      const managerValue = emailLocalPart(s(r.manager_raw));
 
-      const group_value = extract_inside_parens(s(r.group_raw));
-      const manager_value = email_local_part(s(r.manager_raw));
+      const firstName = tiktok ? tiktok : "user_" + String(userId);
 
-      const first_name = tiktok_username ? tiktok_username : "user_" + String(user_id);
-
-      const custom_fields = [
-        { name: "neon_user_id", value: String(user_id) },
-        { name: "creator_id", value: creator_id || null },
-        { name: "tiktok_username", value: tiktok_username || null },
-        { name: "agency_status", value: agency_status || null },
-        { name: "Group", value: group_value || null },
-        { name: "Manager", value: manager_value || null }
+      const customFields = [
+        { name: "neon_user_id", value: String(userId) },
+        { name: "creator_id", value: creatorId || null },
+        { name: "tiktok_username", value: tiktok || null },
+        { name: "agency_status", value: agencyStatus || null },
+        { name: "Group", value: groupValue || null },
+        { name: "Manager", value: managerValue || null }
       ];
 
-      const cu = await respond_create_or_update(
-        phone_e164,
-        first_name,
-        s(r.profile_pic_url),
-        custom_fields
-      );
-
+      const cu = await respondCreateOrUpdate(token, phone, firstName, s(r.profile_pic_url), customFields);
       if (!cu.ok) {
         throw new Error("Create or update failed HTTP " + cu.status + " " + cu.text);
       }
 
-      const role_legacy = ["role_creator", "role_manager"];
-      const role_canon = ["Creator", "Manager"];
-      const role_delete = uniq(role_legacy.concat(role_canon));
+      const roleLegacy = ["role_creator", "role_manager"];
+      const roleCanon = ["Creator", "Manager"];
+      const roleDelete = uniq(roleLegacy.concat(roleCanon));
 
-      const dr = await respond_delete_tags(phone_e164, role_delete);
+      const dr = await respondDeleteTags(token, phone, roleDelete);
       if (!dr.ok) {
         throw new Error("Delete role tags failed HTTP " + dr.status + " " + dr.text);
       }
 
-      if (role_tag) {
-        const ar = await respond_add_tags(phone_e164, [role_tag]);
+      if (roleTag) {
+        const ar = await respondAddTags(token, phone, [roleTag]);
         if (!ar.ok) {
           throw new Error("Add role tag failed HTTP " + ar.status + " " + ar.text);
         }
       }
 
-      if (tier_universe.length > 0) {
-        const dt = await respond_delete_tags(phone_e164, tier_universe);
+      if (tierUniverse.length > 0) {
+        const dt = await respondDeleteTags(token, phone, tierUniverse);
         if (!dt.ok) {
           throw new Error("Delete tier tags failed HTTP " + dt.status + " " + dt.text);
         }
 
-        if (tier_tag) {
-          const at = await respond_add_tags(phone_e164, [tier_tag]);
+        if (tierTag) {
+          const at = await respondAddTags(token, phone, [tierTag]);
           if (!at.ok) {
             throw new Error("Add tier tag failed HTTP " + at.status + " " + at.text);
           }
@@ -340,41 +355,35 @@ async function main() {
       synced += 1;
       ok += 1;
 
-      console.log(
-        "OK sync user_id=" + user_id +
-        " phone=" + phone_e164 +
-        " group=" + group_value +
-        " manager=" + manager_value
+      log(
+        "OK sync",
+        "user_id=" + userId,
+        "phone=" + phone,
+        "group=" + groupValue,
+        "manager=" + managerValue
       );
     } catch (e) {
       fail += 1;
-      console.log(
-        "FAIL user_id=" + user_id +
-        " phone=" + phone_e164 +
-        " err=" + String(e && e.message ? e.message : e)
-      );
+      log("FAIL", "user_id=" + userId, "phone=" + phone, "err=" + String(e && e.message ? e.message : e));
     }
 
-    await sleep_ms(pace_ms);
+    await sleepMs(paceMs);
   }
 
-  console.log(
-    "Summary total=" + total +
-    " ok=" + ok +
-    " fail=" + fail +
-    " synced=" + synced +
-    " deleted=" + deleted
+  log(
+    "Summary",
+    "total=" + total,
+    "ok=" + ok,
+    "fail=" + fail,
+    "synced=" + synced,
+    "deleted=" + deleted
   );
 
   await pool.end();
-  console.log("Worker completed");
+  log("Worker completed");
 }
 
-main().catch(async (e) => {
-  console.error("FATAL " + String(e && e.message ? e.message : e));
-  try {
-    await pool.end();
-  } catch {
-  }
-  process.exitCode = 1;
+main().catch((e) => {
+  console.error(nowIso(), "FATAL", e && e.stack ? e.stack : String(e));
+  process.exit(1);
 });
