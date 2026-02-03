@@ -291,7 +291,7 @@ async function upsertRespondState(userId, state) {
   }
 }
 
-function normalizeDesiredTags(row) {
+function desiredTagsFromRow(row) {
   return uniqueStrings([
     safeString(row.role_tag),
     safeString(row.group_tag),
@@ -300,7 +300,7 @@ function normalizeDesiredTags(row) {
   ]);
 }
 
-function normalizeLastTags(row) {
+function lastTagsFromRow(row) {
   return uniqueStrings([
     safeString(row.last_role_tag),
     safeString(row.last_group_tag),
@@ -338,15 +338,15 @@ function needsFieldUpdate(row, firstName, profilePicUrl) {
 async function main() {
   console.log("Worker start");
 
-  const limit = Number(process.env.SYNC_LIMIT || "200");
+  const limit = Number(process.env.SYNC_LIMIT || "600");
   const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "400");
 
   const rows = await fetchWork(limit);
 
   let ok = 0;
   let fail = 0;
-  let deleted = 0;
   let updated = 0;
+  let deleted = 0;
   let noChange = 0;
 
   for (const r of rows) {
@@ -360,7 +360,9 @@ async function main() {
 
       if (agencyStatus === "left_agency") {
         const del = await deleteContact({ phoneE164 });
-        if (!del.ok && del.status !== 400) {
+
+        const treatNotFoundAsOk = del.status === 400 || del.status === 404;
+        if (!del.ok && !treatNotFoundAsOk) {
           throw new Error(`Delete contact failed HTTP ${del.status} ${del.text}`);
         }
 
@@ -394,15 +396,16 @@ async function main() {
         { name: "agency_status", value: agencyStatus }
       ];
 
-      const desiredTags = normalizeDesiredTags(r);
-      const lastTags = normalizeLastTags(r);
-      const { toAdd, toRemove } = computeTagDiff(desiredTags, lastTags);
+      const desiredTags = desiredTagsFromRow(r);
+      const lastTags = lastTagsFromRow(r);
 
       const fieldUpdateNeeded = needsFieldUpdate(r, firstName, profilePicUrl);
+      const { toAdd, toRemove } = computeTagDiff(desiredTags, lastTags);
       const tagUpdateNeeded = toAdd.length > 0 || toRemove.length > 0;
 
       if (!fieldUpdateNeeded && !tagUpdateNeeded) {
         noChange += 1;
+        ok += 1;
         console.log(`OK no_change user_id=${userId} phone=${phoneE164}`);
         await sleep(perContactPaceMs);
         continue;
@@ -416,6 +419,12 @@ async function main() {
       const contactId = contactIdFromJson(cu.json);
       if (contactId) {
         await upsertRespondContacts(userId, phoneE164, contactId);
+      }
+
+      const legacyRoleTags = ["role_creator", "role_manager"];
+      const delLegacy = await deleteTags({ phoneE164, tags: legacyRoleTags });
+      if (!delLegacy.ok) {
+        throw new Error(`Delete legacy tags failed HTTP ${delLegacy.status} ${delLegacy.text}`);
       }
 
       if (toRemove.length > 0) {
@@ -452,7 +461,7 @@ async function main() {
       );
     } catch (e) {
       fail += 1;
-      console.log(`FAIL user_id=${r.user_id} phone=${r.phone_e164} err=${String(e.message || e)}`);
+      console.log(`FAIL user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
     }
 
     await sleep(perContactPaceMs);
