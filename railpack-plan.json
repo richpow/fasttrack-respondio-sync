@@ -1,0 +1,14 @@
+{
+  "version": "1",
+  "build": {
+    "steps": [
+      {
+        "name": "install",
+        "command": "npm install"
+      }
+    ]
+  },
+  "deploy": {
+    "command": "npm run start"
+  }
+}
