@@ -1,37 +1,37 @@
-import fetch from "node-fetch";
 import pg from "pg";
 
 const { Pool } = pg;
 
-function env(name) {
+function env_required(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+  if (!v) throw new Error("Missing env var: " + name);
+  return String(v);
 }
 
-function envOptional(name) {
+function env_optional(name, fallback_value) {
   const v = process.env[name];
-  return v === undefined ? "" : String(v);
+  if (v === undefined || v === null) return fallback_value;
+  return String(v);
 }
 
-function isNonEmptyString(v) {
+function is_non_empty_string(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
 
-function safeString(v) {
-  return isNonEmptyString(v) ? v.trim() : "";
+function s(v) {
+  return is_non_empty_string(v) ? v.trim() : "";
 }
 
-function sleep(ms) {
+function sleep_ms(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function uniqueStrings(arr) {
+function uniq(arr) {
   const out = [];
   const seen = new Set();
-  for (const x of arr) {
-    if (!isNonEmptyString(x)) continue;
-    const v = x.trim();
+  for (const item of arr) {
+    const v = s(item);
+    if (!v) continue;
     if (seen.has(v)) continue;
     seen.add(v);
     out.push(v);
@@ -39,79 +39,72 @@ function uniqueStrings(arr) {
   return out;
 }
 
-function parseCsvTags(v) {
-  const s = safeString(v);
-  if (!s) return [];
-  return uniqueStrings(
-    s.split(",").map((x) => x.trim()).filter((x) => x.length > 0)
-  );
+function split_csv(v) {
+  const txt = s(v);
+  if (!txt) return [];
+  return uniq(txt.split(",").map((x) => s(x)).filter((x) => x.length > 0));
 }
 
-function extractBracketValue(s) {
-  const v = safeString(s);
-  if (!v) return "";
+function chunk_10(arr) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += 10) out.push(arr.slice(i, i + 10));
+  return out;
+}
 
-  const open = v.indexOf("(");
-  const close = v.lastIndexOf(")");
-
-  if (open >= 0 && close > open) {
-    const inside = v.slice(open + 1, close).trim();
-    return inside || v;
+function extract_inside_parens(v) {
+  const txt = s(v);
+  if (!txt) return "";
+  const open_i = txt.indexOf("(");
+  const close_i = txt.lastIndexOf(")");
+  if (open_i >= 0 && close_i > open_i) {
+    const inside = txt.slice(open_i + 1, close_i).trim();
+    return inside || txt;
   }
-
-  return v;
+  return txt;
 }
 
-function emailLocalPart(s) {
-  const v = safeString(s);
-  if (!v) return "";
-
-  const at = v.indexOf("@");
-  if (at > 0) return v.slice(0, at).trim() || v;
-
-  return v;
+function email_local_part(v) {
+  const txt = s(v);
+  if (!txt) return "";
+  const at_i = txt.indexOf("@");
+  if (at_i > 0) {
+    const left = txt.slice(0, at_i).trim();
+    return left || txt;
+  }
+  return txt;
 }
 
-function normalizeGroupField(row) {
-  const raw = safeString(row.group_value) || safeString(row.group_tag) || "";
-  return extractBracketValue(raw);
-}
+const dash = String.fromCharCode(45);
+const accept_json = "application/json";
+const accept_multi = "application/json, application/xml, multipart/form" + dash + "data";
+const header_auth = "Authorization";
+const header_ct = "Content" + dash + "Type";
 
-function normalizeManagerField(row) {
-  const raw = safeString(row.manager_value) || safeString(row.creator_network_manager_tag) || "";
-  return emailLocalPart(raw);
-}
-
-let shuttingDown = false;
+let shutting_down = false;
 
 process.on("SIGTERM", () => {
-  shuttingDown = true;
-  console.log("SIGTERM received, will stop after current item");
+  shutting_down = true;
+  console.log("SIGTERM received");
 });
 
 process.on("SIGINT", () => {
-  shuttingDown = true;
-  console.log("SIGINT received, will stop after current item");
+  shutting_down = true;
+  console.log("SIGINT received");
 });
 
-const pool = new Pool({
-  connectionString: env("DATABASE_URL"),
-  ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined
-});
-
-function respondHeaders(acceptOverride) {
-  return {
-    Accept: acceptOverride || "application/json",
-    Authorization: `Bearer ${env("RESPOND_IO_TOKEN")}`,
-    "Content-Type": "application/json"
-  };
+function respond_headers(accept_value) {
+  const h = {};
+  h.Accept = accept_value || accept_json;
+  h[header_auth] = "Bearer " + env_required("RESPOND_IO_TOKEN");
+  h[header_ct] = accept_json;
+  return h;
 }
 
-async function http(method, url, body, acceptOverride) {
+async function http_call(method, url, body, accept_value) {
   const res = await fetch(url, {
     method,
-    headers: respondHeaders(acceptOverride),
-    body: body !== undefined ? JSON.stringify(body) : undefined
+    headers: respond_headers(accept_value),
+    body: body === undefined ? undefined : JSON.stringify(body)
   });
 
   const text = await res.text();
@@ -125,390 +118,260 @@ async function http(method, url, body, acceptOverride) {
   return { ok: res.ok, status: res.status, text, json };
 }
 
-async function withQueueRetry(fn) {
-  const maxAttempts = Number(envOptional("RESPOND_IO_RETRY_MAX") || "8");
-  const baseDelayMs = Number(envOptional("RESPOND_IO_RETRY_BASE_MS") || "2000");
-  const maxDelayMs = Number(envOptional("RESPOND_IO_RETRY_MAX_MS") || "30000");
+async function with_queue_retry(fn) {
+  const max_attempts = Number(env_optional("RESPOND_IO_RETRY_MAX", "8"));
+  const base_delay_ms = Number(env_optional("RESPOND_IO_RETRY_BASE_MS", "2000"));
+  const max_delay_ms = Number(env_optional("RESPOND_IO_RETRY_MAX_MS", "30000"));
 
   let attempt = 0;
+
   while (true) {
     attempt += 1;
-    const res = await fn();
 
-    if (res.ok) return res;
+    const r = await fn();
+    if (r.ok) return r;
 
-    const isQueue =
-      res.status === 449 &&
-      isNonEmptyString(res.text) &&
-      res.text.includes("in the queue");
+    const is_queue =
+      r.status === 449 &&
+      is_non_empty_string(r.text) &&
+      r.text.includes("in the queue");
 
-    if (!isQueue) return res;
-    if (attempt >= maxAttempts) return res;
+    if (!is_queue) return r;
+    if (attempt >= max_attempts) return r;
 
-    const delay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));
-    console.log(`HTTP 449 queue, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
-    await sleep(delay);
+    const delay = Math.min(max_delay_ms, base_delay_ms * Math.pow(2, attempt - 1));
+    console.log("HTTP 449 queue, retry in ms: " + delay + ", attempt " + attempt + " of " + max_attempts);
+    await sleep_ms(delay);
 
-    if (shuttingDown) return res;
+    if (shutting_down) return r;
   }
 }
 
-function urlWithPhone(templateEnvVar, phoneE164) {
-  const base = env(templateEnvVar);
-  const identifier = `phone:${phoneE164}`;
+function url_with_identifier(template_env, phone_e164) {
+  const base = env_required(template_env);
+  const identifier = "phone:" + phone_e164;
   return base.replace("{identifier}", identifier);
 }
 
-function buildContactBody({ phoneE164, firstName, profilePicUrl, customFields }) {
+async function respond_create_or_update(phone_e164, first_name, profile_pic, custom_fields) {
+  const url = url_with_identifier("RESPOND_IO_CREATE_OR_UPDATE_URL", phone_e164);
+
   const body = {
-    firstName,
-    phone: phoneE164,
-    custom_fields: customFields
+    firstName: first_name,
+    phone: phone_e164,
+    custom_fields: custom_fields
   };
 
-  if (isNonEmptyString(profilePicUrl)) {
-    body.profilePic = profilePicUrl.trim();
+  if (s(profile_pic)) body.profilePic = s(profile_pic);
+
+  return await with_queue_retry(() => http_call("POST", url, body, accept_multi));
+}
+
+async function respond_delete_contact(phone_e164) {
+  const url = url_with_identifier("RESPOND_IO_DELETE_CONTACT_URL", phone_e164);
+  return await http_call("DELETE", url, undefined, accept_json);
+}
+
+async function respond_add_tags(phone_e164, tags) {
+  const url = url_with_identifier("RESPOND_IO_ADD_TAGS_URL", phone_e164);
+  const payload = uniq(tags);
+
+  if (payload.length === 0) return { ok: true, status: 200, text: "", json: {} };
+
+  for (const part of chunk_10(payload)) {
+    const r = await with_queue_retry(() => http_call("POST", url, part, accept_multi));
+    if (!r.ok) return r;
   }
-
-  return body;
+  return { ok: true, status: 200, text: "", json: {} };
 }
 
-function contactIdFromJson(json) {
-  if (!json) return 0;
-  const v = json.contactId;
-  if (typeof v === "number") return v;
-  if (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))) return Number(v);
-  return 0;
+async function respond_delete_tags(phone_e164, tags) {
+  const url = url_with_identifier("RESPOND_IO_DELETE_TAGS_URL", phone_e164);
+  const payload = uniq(tags);
+
+  if (payload.length === 0) return { ok: true, status: 200, text: "", json: {} };
+
+  for (const part of chunk_10(payload)) {
+    const r = await with_queue_retry(() => http_call("DELETE", url, part, accept_multi));
+    if (!r.ok) return r;
+  }
+  return { ok: true, status: 200, text: "", json: {} };
 }
 
-async function createOrUpdateContact({ phoneE164, firstName, profilePicUrl, customFields }) {
-  const url = urlWithPhone("RESPOND_IO_CREATE_OR_UPDATE_URL", phoneE164);
-  const body = buildContactBody({ phoneE164, firstName, profilePicUrl, customFields });
+const pool = new Pool({
+  connectionString: env_required("DATABASE_URL"),
+  ssl: env_optional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
+});
 
-  const res = await withQueueRetry(() =>
-    http("POST", url, body, "application/json, application/xml, multipart/form-data")
-  );
-
-  return res;
-}
-
-async function addTags({ phoneE164, tags }) {
-  const url = urlWithPhone("RESPOND_IO_ADD_TAGS_URL", phoneE164);
-  const payload = uniqueStrings(tags);
-
-  if (payload.length < 1) return { ok: true, status: 200, text: "", json: { contactId: 0 } };
-  if (payload.length > 10) return { ok: false, status: 400, text: `Too many tags: ${payload.length}`, json: null };
-
-  const res = await withQueueRetry(() =>
-    http("POST", url, payload, "application/json, application/xml, multipart/form-data")
-  );
-
-  return res;
-}
-
-async function deleteTags({ phoneE164, tags }) {
-  const url = urlWithPhone("RESPOND_IO_DELETE_TAGS_URL", phoneE164);
-  const payload = uniqueStrings(tags);
-
-  if (payload.length < 1) return { ok: true, status: 200, text: "", json: { contactId: 0 } };
-  if (payload.length > 10) return { ok: false, status: 400, text: `Too many tags: ${payload.length}`, json: null };
-
-  const res = await withQueueRetry(() =>
-    http("DELETE", url, payload, "application/json, application/xml, multipart/form-data")
-  );
-
-  return res;
-}
-
-async function deleteContact({ phoneE164 }) {
-  const url = urlWithPhone("RESPOND_IO_DELETE_CONTACT_URL", phoneE164);
-  const res = await http("DELETE", url, undefined, "application/json");
-  return res;
-}
-
-async function fetchWork(limit) {
+async function fetch_rows(limit) {
   const client = await pool.connect();
   try {
-    const { rows } = await client.query(
-      `
+    const q = `
       SELECT
-        v.user_id,
-        v.phone_e164,
-        v.tiktok_username,
-        v.creator_id,
-        v.agency_status,
-        v.profile_pic_url,
-        v.role_tag,
-        v.group_tag,
-        v.creator_network_manager_tag,
-        v.tier_tag,
-        v.group_value,
-        v.manager_value,
-        ss.last_role_tag,
-        ss.last_group_tag,
-        ss.last_creator_network_manager_tag,
-        ss.last_tier_tag,
-        ss.last_profile_pic_url,
-        ss.last_first_name,
-        ss.last_creator_id,
-        ss.last_tiktok_username,
-        ss.last_agency_status
-      FROM v_respond_sync_users v
-      LEFT JOIN respond_sync_state ss ON ss.user_id = v.user_id
-      WHERE v.phone_e164 IS NOT NULL
-        AND v.phone_e164 <> ''
-      ORDER BY v.user_id
-      LIMIT $1
-      `,
-      [limit]
-    );
-    return rows;
-  } finally {
-    client.release();
-  }
-}
-
-async function upsertRespondContacts(userId, phoneE164, respondContactId) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `
-      INSERT INTO respond_contacts (user_id, respond_contact_id, phone_e164, created_at, updated_at)
-      VALUES ($1, $2, $3, now(), now())
-      ON CONFLICT (user_id)
-      DO UPDATE SET
-        respond_contact_id = EXCLUDED.respond_contact_id,
-        phone_e164 = EXCLUDED.phone_e164,
-        updated_at = now()
-      `,
-      [userId, Number(respondContactId || 0), phoneE164]
-    );
-  } finally {
-    client.release();
-  }
-}
-
-async function upsertRespondState(userId, state) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `
-      INSERT INTO respond_sync_state (
         user_id,
-        last_role_tag,
-        last_group_tag,
-        last_creator_network_manager_tag,
-        last_tier_tag,
-        last_phone_e164,
-        last_profile_pic_url,
-        last_first_name,
-        last_creator_id,
-        last_tiktok_username,
-        last_agency_status,
-        updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
-      ON CONFLICT (user_id)
-      DO UPDATE SET
-        last_role_tag = EXCLUDED.last_role_tag,
-        last_group_tag = EXCLUDED.last_group_tag,
-        last_creator_network_manager_tag = EXCLUDED.last_creator_network_manager_tag,
-        last_tier_tag = EXCLUDED.last_tier_tag,
-        last_phone_e164 = EXCLUDED.last_phone_e164,
-        last_profile_pic_url = EXCLUDED.last_profile_pic_url,
-        last_first_name = EXCLUDED.last_first_name,
-        last_creator_id = EXCLUDED.last_creator_id,
-        last_tiktok_username = EXCLUDED.last_tiktok_username,
-        last_agency_status = EXCLUDED.last_agency_status,
-        updated_at = now()
-      `,
-      [
-        userId,
-        state.last_role_tag,
-        state.last_group_tag,
-        state.last_creator_network_manager_tag,
-        state.last_tier_tag,
-        state.last_phone_e164,
-        state.last_profile_pic_url,
-        state.last_first_name,
-        state.last_creator_id,
-        state.last_tiktok_username,
-        state.last_agency_status
-      ]
-    );
+        phone_e164,
+        tiktok_username,
+        creator_id,
+        agency_status,
+        role_tag,
+        group_raw,
+        manager_raw,
+        tier_tag,
+        profile_pic_url
+      FROM v_respond_sync_users
+      ORDER BY user_id
+      LIMIT $1
+    `;
+    const res = await client.query(q, [limit]);
+    return res.rows;
   } finally {
     client.release();
   }
-}
-
-function desiredTagsFromRow(row) {
-  return uniqueStrings([
-    safeString(row.role_tag),
-    safeString(row.group_tag),
-    safeString(row.creator_network_manager_tag),
-    safeString(row.tier_tag)
-  ]);
 }
 
 async function main() {
+  console.log("BOOT worker.js");
   console.log("Worker start");
 
-  const limit = Number(envOptional("SYNC_LIMIT") || "600");
-  const perContactPaceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS") || "400");
-  const tierTagUniverse = parseCsvTags(envOptional("TIER_TAGS_CSV"));
+  const limit = Number(env_optional("SYNC_LIMIT", "800"));
+  const pace_ms = Number(env_optional("RESPOND_IO_PER_CONTACT_PACE_MS", "600"));
+  const tier_universe = split_csv(env_optional("TIER_TAGS_CSV", ""));
 
+  let total = 0;
   let ok = 0;
   let fail = 0;
-  let updated = 0;
+  let synced = 0;
   let deleted = 0;
 
-  const rows = await fetchWork(limit);
+  const rows = await fetch_rows(limit);
 
   for (const r of rows) {
-    if (shuttingDown) break;
+    if (shutting_down) break;
 
-    const userId = r.user_id;
-    const phoneE164 = r.phone_e164;
+    total += 1;
+
+    const user_id = r.user_id;
+    const phone_e164 = s(r.phone_e164);
 
     try {
-      const agencyStatus = safeString(r.agency_status);
-
-      if (agencyStatus === "left_agency") {
-        const del = await deleteContact({ phoneE164 });
-        const treatNotFoundAsOk = del.status === 400 || del.status === 404;
-
-        if (!del.ok && !treatNotFoundAsOk) {
-          throw new Error(`Delete contact failed HTTP ${del.status} ${del.text}`);
-        }
-
-        await upsertRespondState(userId, {
-          last_role_tag: null,
-          last_group_tag: null,
-          last_creator_network_manager_tag: null,
-          last_tier_tag: null,
-          last_phone_e164: phoneE164,
-          last_profile_pic_url: null,
-          last_first_name: null,
-          last_creator_id: null,
-          last_tiktok_username: null,
-          last_agency_status: agencyStatus
-        });
-
-        deleted += 1;
+      if (!phone_e164) {
         ok += 1;
-        console.log(`OK delete user_id=${userId} phone=${phoneE164}`);
-        await sleep(perContactPaceMs);
         continue;
       }
 
-      const firstName = safeString(r.tiktok_username) || `user_${userId}`;
-      const profilePicUrl = safeString(r.profile_pic_url);
+      const agency_status = s(r.agency_status);
 
-      const groupFieldValue = normalizeGroupField(r);
-      const managerFieldValue = normalizeManagerField(r);
+      if (agency_status === "left_agency") {
+        const del = await respond_delete_contact(phone_e164);
 
-      const customFields = [
-        { name: "neon_user_id", value: String(userId) },
-        { name: "creator_id", value: safeString(r.creator_id) || null },
-        { name: "tiktok_username", value: safeString(r.tiktok_username) || null },
-        { name: "agency_status", value: agencyStatus || null },
-        { name: "Group", value: groupFieldValue || null },
-        { name: "Manager", value: managerFieldValue || null }
+        const treat_missing_ok = del.status === 400 || del.status === 404;
+        if (!del.ok && !treat_missing_ok) {
+          throw new Error("Delete contact failed HTTP " + del.status + " " + del.text);
+        }
+
+        deleted += 1;
+        ok += 1;
+        console.log("OK delete user_id=" + user_id + " phone=" + phone_e164);
+        await sleep_ms(pace_ms);
+        continue;
+      }
+
+      const tiktok_username = s(r.tiktok_username);
+      const creator_id = s(r.creator_id);
+
+      const role_tag = s(r.role_tag);
+      const tier_tag = s(r.tier_tag);
+
+      const group_value = extract_inside_parens(s(r.group_raw));
+      const manager_value = email_local_part(s(r.manager_raw));
+
+      const first_name = tiktok_username ? tiktok_username : "user_" + String(user_id);
+
+      const custom_fields = [
+        { name: "neon_user_id", value: String(user_id) },
+        { name: "creator_id", value: creator_id || null },
+        { name: "tiktok_username", value: tiktok_username || null },
+        { name: "agency_status", value: agency_status || null },
+        { name: "Group", value: group_value || null },
+        { name: "Manager", value: manager_value || null }
       ];
 
-      const cu = await createOrUpdateContact({ phoneE164, firstName, profilePicUrl, customFields });
+      const cu = await respond_create_or_update(
+        phone_e164,
+        first_name,
+        s(r.profile_pic_url),
+        custom_fields
+      );
+
       if (!cu.ok) {
-        throw new Error(`Create or update failed HTTP ${cu.status} ${cu.text}`);
+        throw new Error("Create or update failed HTTP " + cu.status + " " + cu.text);
       }
 
-      const contactId = contactIdFromJson(cu.json);
-      if (contactId) {
-        await upsertRespondContacts(userId, phoneE164, contactId);
+      const role_legacy = ["role_creator", "role_manager"];
+      const role_canon = ["Creator", "Manager"];
+      const role_delete = uniq(role_legacy.concat(role_canon));
+
+      const dr = await respond_delete_tags(phone_e164, role_delete);
+      if (!dr.ok) {
+        throw new Error("Delete role tags failed HTTP " + dr.status + " " + dr.text);
       }
 
-      const roleDesired = safeString(r.role_tag);
-      const tierDesired = safeString(r.tier_tag);
-
-      const legacyRoleTags = ["role_creator", "role_manager"];
-      const roleUniverse = ["Creator", "Manager"];
-      const roleToDelete = uniqueStrings(legacyRoleTags.concat(roleUniverse));
-      const roleToAdd = roleDesired ? [roleDesired] : [];
-
-      const delRole = await deleteTags({ phoneE164, tags: roleToDelete });
-      if (!delRole.ok) {
-        throw new Error(`Delete role tags failed HTTP ${delRole.status} ${delRole.text}`);
-      }
-
-      if (roleToAdd.length > 0) {
-        const addRole = await addTags({ phoneE164, tags: roleToAdd });
-        if (!addRole.ok) {
-          throw new Error(`Add role tag failed HTTP ${addRole.status} ${addRole.text}`);
+      if (role_tag) {
+        const ar = await respond_add_tags(phone_e164, [role_tag]);
+        if (!ar.ok) {
+          throw new Error("Add role tag failed HTTP " + ar.status + " " + ar.text);
         }
       }
 
-      if (tierTagUniverse.length > 0) {
-        const delTier = await deleteTags({ phoneE164, tags: tierTagUniverse });
-        if (!delTier.ok) {
-          throw new Error(`Delete tier tags failed HTTP ${delTier.status} ${delTier.text}`);
+      if (tier_universe.length > 0) {
+        const dt = await respond_delete_tags(phone_e164, tier_universe);
+        if (!dt.ok) {
+          throw new Error("Delete tier tags failed HTTP " + dt.status + " " + dt.text);
         }
 
-        if (tierDesired) {
-          const addTier = await addTags({ phoneE164, tags: [tierDesired] });
-          if (!addTier.ok) {
-            throw new Error(`Add tier tag failed HTTP ${addTier.status} ${addTier.text}`);
+        if (tier_tag) {
+          const at = await respond_add_tags(phone_e164, [tier_tag]);
+          if (!at.ok) {
+            throw new Error("Add tier tag failed HTTP " + at.status + " " + at.text);
           }
         }
       }
 
-      const desiredTags = desiredTagsFromRow(r);
-      const nonRoleNonTierDesired = desiredTags.filter((t) => {
-        if (t === "Creator" || t === "Manager") return false;
-        if (tierTagUniverse.includes(t)) return false;
-        if (t.toLowerCase().startsWith("tier:")) return false;
-        return true;
-      });
-
-      if (nonRoleNonTierDesired.length > 0) {
-        const addOther = await addTags({ phoneE164, tags: nonRoleNonTierDesired });
-        if (!addOther.ok) {
-          throw new Error(`Add tags failed HTTP ${addOther.status} ${addOther.text}`);
-        }
-      }
-
-      await upsertRespondState(userId, {
-        last_role_tag: roleDesired || null,
-        last_group_tag: safeString(r.group_tag) || null,
-        last_creator_network_manager_tag: safeString(r.creator_network_manager_tag) || null,
-        last_tier_tag: tierDesired || null,
-        last_phone_e164: phoneE164,
-        last_profile_pic_url: profilePicUrl || null,
-        last_first_name: firstName || null,
-        last_creator_id: safeString(r.creator_id) || null,
-        last_tiktok_username: safeString(r.tiktok_username) || null,
-        last_agency_status: agencyStatus || null
-      });
-
-      updated += 1;
+      synced += 1;
       ok += 1;
 
       console.log(
-        `OK sync user_id=${userId} phone=${phoneE164} group=${groupFieldValue} manager=${managerFieldValue}`
+        "OK sync user_id=" + user_id +
+        " phone=" + phone_e164 +
+        " group=" + group_value +
+        " manager=" + manager_value
       );
     } catch (e) {
       fail += 1;
-      console.log(`FAIL user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
+      console.log(
+        "FAIL user_id=" + user_id +
+        " phone=" + phone_e164 +
+        " err=" + String(e && e.message ? e.message : e)
+      );
     }
 
-    await sleep(perContactPaceMs);
+    await sleep_ms(pace_ms);
   }
 
-  console.log(`Summary total=${rows.length} ok=${ok} fail=${fail} updated=${updated} deleted=${deleted}`);
+  console.log(
+    "Summary total=" + total +
+    " ok=" + ok +
+    " fail=" + fail +
+    " synced=" + synced +
+    " deleted=" + deleted
+  );
+
   await pool.end();
   console.log("Worker completed");
 }
 
 main().catch(async (e) => {
-  console.error(String(e.message || e));
+  console.error("FATAL " + String(e && e.message ? e.message : e));
   try {
     await pool.end();
   } catch {
