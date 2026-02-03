@@ -9,6 +9,11 @@ function env(name) {
   return v;
 }
 
+function envOptional(name) {
+  const v = process.env[name];
+  return v === undefined ? "" : String(v);
+}
+
 function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
@@ -32,6 +37,14 @@ function uniqueStrings(arr) {
     out.push(v);
   }
   return out;
+}
+
+function parseCsvTags(v) {
+  const s = safeString(v);
+  if (!s) return [];
+  return uniqueStrings(
+    s.split(",").map((x) => x.trim()).filter((x) => x.length > 0)
+  );
 }
 
 let shuttingDown = false;
@@ -78,9 +91,9 @@ async function http(method, url, body, acceptOverride) {
 }
 
 async function withQueueRetry(fn) {
-  const maxAttempts = Number(process.env.RESPOND_IO_RETRY_MAX || "8");
-  const baseDelayMs = Number(process.env.RESPOND_IO_RETRY_BASE_MS || "2000");
-  const maxDelayMs = Number(process.env.RESPOND_IO_RETRY_MAX_MS || "30000");
+  const maxAttempts = Number(envOptional("RESPOND_IO_RETRY_MAX") || "8");
+  const baseDelayMs = Number(envOptional("RESPOND_IO_RETRY_BASE_MS") || "2000");
+  const maxDelayMs = Number(envOptional("RESPOND_IO_RETRY_MAX_MS") || "30000");
 
   let attempt = 0;
   while (true) {
@@ -300,32 +313,6 @@ function desiredTagsFromRow(row) {
   ]);
 }
 
-function lastTagsFromRow(row) {
-  return uniqueStrings([
-    safeString(row.last_role_tag),
-    safeString(row.last_group_tag),
-    safeString(row.last_creator_network_manager_tag),
-    safeString(row.last_tier_tag)
-  ]);
-}
-
-function computeTagDiff(desired, last) {
-  const desiredSet = new Set(desired);
-  const lastSet = new Set(last);
-
-  const toAdd = [];
-  for (const t of desired) {
-    if (!lastSet.has(t)) toAdd.push(t);
-  }
-
-  const toRemove = [];
-  for (const t of last) {
-    if (!desiredSet.has(t)) toRemove.push(t);
-  }
-
-  return { toAdd, toRemove };
-}
-
 function needsFieldUpdate(row, firstName, profilePicUrl) {
   if (safeString(row.last_first_name) !== safeString(firstName)) return true;
   if (safeString(row.last_profile_pic_url) !== safeString(profilePicUrl)) return true;
@@ -338,16 +325,17 @@ function needsFieldUpdate(row, firstName, profilePicUrl) {
 async function main() {
   console.log("Worker start");
 
-  const limit = Number(process.env.SYNC_LIMIT || "600");
-  const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "400");
+  const limit = Number(envOptional("SYNC_LIMIT") || "600");
+  const perContactPaceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS") || "400");
 
-  const rows = await fetchWork(limit);
+  const tierTagUniverse = parseCsvTags(envOptional("TIER_TAGS_CSV"));
 
   let ok = 0;
   let fail = 0;
   let updated = 0;
   let deleted = 0;
-  let noChange = 0;
+
+  const rows = await fetchWork(limit);
 
   for (const r of rows) {
     if (shuttingDown) break;
@@ -360,8 +348,8 @@ async function main() {
 
       if (agencyStatus === "left_agency") {
         const del = await deleteContact({ phoneE164 });
-
         const treatNotFoundAsOk = del.status === 400 || del.status === 404;
+
         if (!del.ok && !treatNotFoundAsOk) {
           throw new Error(`Delete contact failed HTTP ${del.status} ${del.text}`);
         }
@@ -396,21 +384,6 @@ async function main() {
         { name: "agency_status", value: agencyStatus }
       ];
 
-      const desiredTags = desiredTagsFromRow(r);
-      const lastTags = lastTagsFromRow(r);
-
-      const fieldUpdateNeeded = needsFieldUpdate(r, firstName, profilePicUrl);
-      const { toAdd, toRemove } = computeTagDiff(desiredTags, lastTags);
-      const tagUpdateNeeded = toAdd.length > 0 || toRemove.length > 0;
-
-      if (!fieldUpdateNeeded && !tagUpdateNeeded) {
-        noChange += 1;
-        ok += 1;
-        console.log(`OK no_change user_id=${userId} phone=${phoneE164}`);
-        await sleep(perContactPaceMs);
-        continue;
-      }
-
       const cu = await createOrUpdateContact({ phoneE164, firstName, profilePicUrl, customFields });
       if (!cu.ok) {
         throw new Error(`Create or update failed HTTP ${cu.status} ${cu.text}`);
@@ -421,31 +394,64 @@ async function main() {
         await upsertRespondContacts(userId, phoneE164, contactId);
       }
 
+      const desiredTags = desiredTagsFromRow(r);
+
+      const roleDesired = safeString(r.role_tag);
+      const tierDesired = safeString(r.tier_tag);
+
       const legacyRoleTags = ["role_creator", "role_manager"];
-      const delLegacy = await deleteTags({ phoneE164, tags: legacyRoleTags });
-      if (!delLegacy.ok) {
-        throw new Error(`Delete legacy tags failed HTTP ${delLegacy.status} ${delLegacy.text}`);
+      const roleUniverse = ["Creator", "Manager"];
+
+      const roleToDelete = uniqueStrings(legacyRoleTags.concat(roleUniverse));
+      const roleToAdd = roleDesired ? [roleDesired] : [];
+
+      const delRole = await deleteTags({ phoneE164, tags: roleToDelete });
+      if (!delRole.ok) {
+        throw new Error(`Delete role tags failed HTTP ${delRole.status} ${delRole.text}`);
       }
 
-      if (toRemove.length > 0) {
-        const delTags = await deleteTags({ phoneE164, tags: toRemove });
-        if (!delTags.ok) {
-          throw new Error(`Delete tags failed HTTP ${delTags.status} ${delTags.text}`);
+      if (roleToAdd.length > 0) {
+        const addRole = await addTags({ phoneE164, tags: roleToAdd });
+        if (!addRole.ok) {
+          throw new Error(`Add role tag failed HTTP ${addRole.status} ${addRole.text}`);
         }
       }
 
-      if (toAdd.length > 0) {
-        const add = await addTags({ phoneE164, tags: toAdd });
-        if (!add.ok) {
-          throw new Error(`Add tags failed HTTP ${add.status} ${add.text}`);
+      if (tierTagUniverse.length > 0) {
+        const delTier = await deleteTags({ phoneE164, tags: tierTagUniverse });
+        if (!delTier.ok) {
+          throw new Error(`Delete tier tags failed HTTP ${delTier.status} ${delTier.text}`);
+        }
+
+        if (tierDesired) {
+          const addTier = await addTags({ phoneE164, tags: [tierDesired] });
+          if (!addTier.ok) {
+            throw new Error(`Add tier tag failed HTTP ${addTier.status} ${addTier.text}`);
+          }
         }
       }
+
+      const nonRoleNonTierDesired = desiredTags.filter((t) => {
+        if (t === "Creator" || t === "Manager") return false;
+        if (tierTagUniverse.includes(t)) return false;
+        if (t.startsWith("Tier:")) return false;
+        return true;
+      });
+
+      if (nonRoleNonTierDesired.length > 0) {
+        const addOther = await addTags({ phoneE164, tags: nonRoleNonTierDesired });
+        if (!addOther.ok) {
+          throw new Error(`Add tags failed HTTP ${addOther.status} ${addOther.text}`);
+        }
+      }
+
+      const fieldUpdateNeeded = needsFieldUpdate(r, firstName, profilePicUrl);
 
       await upsertRespondState(userId, {
-        last_role_tag: desiredTags[0] || null,
-        last_group_tag: desiredTags[1] || null,
-        last_creator_network_manager_tag: desiredTags[2] || null,
-        last_tier_tag: desiredTags[3] || null,
+        last_role_tag: roleDesired || null,
+        last_group_tag: safeString(r.group_tag) || null,
+        last_creator_network_manager_tag: safeString(r.creator_network_manager_tag) || null,
+        last_tier_tag: tierDesired || null,
         last_phone_e164: phoneE164,
         last_profile_pic_url: profilePicUrl || null,
         last_first_name: firstName || null,
@@ -456,9 +462,11 @@ async function main() {
 
       updated += 1;
       ok += 1;
-      console.log(
-        `OK update user_id=${userId} phone=${phoneE164} remove=${toRemove.length} add=${toAdd.length}`
-      );
+
+      const roleInfo = `role=${roleDesired || "none"}`;
+      const tierInfo = tierTagUniverse.length > 0 ? ` tier=${tierDesired || "none"}` : "";
+      const fieldsInfo = fieldUpdateNeeded ? " fields=checked" : " fields=checked";
+      console.log(`OK sync user_id=${userId} phone=${phoneE164} ${roleInfo}${tierInfo}${fieldsInfo}`);
     } catch (e) {
       fail += 1;
       console.log(`FAIL user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
@@ -467,18 +475,9 @@ async function main() {
     await sleep(perContactPaceMs);
   }
 
-  console.log(
-    `Summary total=${rows.length} ok=${ok} fail=${fail} updated=${updated} deleted=${deleted} no_change=${noChange}`
-  );
-
+  console.log(`Summary total=${rows.length} ok=${ok} fail=${fail} updated=${updated} deleted=${deleted}`);
   await pool.end();
-
-  if (shuttingDown) {
-    console.log("Worker exit clean after shutdown signal");
-    process.exitCode = 0;
-  } else {
-    console.log("Worker completed");
-  }
+  console.log("Worker completed");
 }
 
 main().catch(async (e) => {
