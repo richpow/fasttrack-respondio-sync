@@ -1,0 +1,13 @@
+{
+  "name": "respondio-sync-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "pg": "^8.12.0",
+    "node-fetch": "^3.3.2"
+  }
+}
