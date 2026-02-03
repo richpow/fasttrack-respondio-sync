@@ -229,6 +229,43 @@ async function fetchProfilePicUpdates(limit) {
   }
 }
 
+async function fetchTagDriftUpdates(limit) {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      `
+      SELECT
+        v.user_id,
+        v.phone_e164,
+        v.tiktok_username,
+        v.creator_id,
+        v.agency_status,
+        v.profile_pic_url,
+        v.role_tag,
+        v.group_tag,
+        v.creator_network_manager_tag,
+        v.tier_tag
+      FROM v_respond_sync_users v
+      JOIN respond_contacts rc ON rc.user_id = v.user_id
+      LEFT JOIN respond_sync_state ss ON ss.user_id = v.user_id
+      WHERE v.agency_status = 'in_agency'
+        AND (
+          COALESCE(ss.last_role_tag, '') <> COALESCE(v.role_tag, '')
+          OR COALESCE(ss.last_group_tag, '') <> COALESCE(v.group_tag, '')
+          OR COALESCE(ss.last_creator_network_manager_tag, '') <> COALESCE(v.creator_network_manager_tag, '')
+          OR COALESCE(ss.last_tier_tag, '') <> COALESCE(v.tier_tag, '')
+        )
+      ORDER BY v.user_id
+      LIMIT $1
+      `,
+      [limit]
+    );
+    return rows;
+  } finally {
+    client.release();
+  }
+}
+
 async function upsertMappingAndState({ userId, respondContactId, phoneE164, roleTag, groupTag, cnmTag, tierTag, profilePicUrl }) {
   const client = await pool.connect();
   try {
@@ -424,10 +461,78 @@ async function runProfilePicUpdates() {
   console.log(`Profile pic updates finished processed=${updates.length} ok=${ok} fail=${fail}`);
 }
 
+async function runTagDriftUpdates() {
+  const limit = Number(process.env.TAG_UPDATE_LIMIT || "200");
+  const perContactPaceMs = Number(process.env.RESPOND_IO_PER_CONTACT_PACE_MS || "250");
+
+  const updates = await fetchTagDriftUpdates(limit);
+
+  let ok = 0;
+  let fail = 0;
+
+  for (const r of updates) {
+    if (shuttingDown) break;
+
+    const userId = r.user_id;
+    const phoneE164 = r.phone_e164;
+
+    const firstName = safeString(r.tiktok_username) || `user_${userId}`;
+    const profilePicUrl = safeString(r.profile_pic_url);
+
+    const customFields = [
+      { name: "neon_user_id", value: String(userId) },
+      { name: "creator_id", value: safeString(r.creator_id) },
+      { name: "tiktok_username", value: safeString(r.tiktok_username) },
+      { name: "agency_status", value: safeString(r.agency_status) }
+    ];
+
+    const roleTag = r.role_tag;
+    const groupTag = r.group_tag;
+    const cnmTag = r.creator_network_manager_tag;
+    const tierTag = r.tier_tag;
+
+    const tagsToAdd = [roleTag, groupTag, cnmTag, tierTag];
+
+    try {
+      const upd = await updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields });
+      if (!upd.ok) {
+        throw new Error(`Update failed HTTP ${upd.status} ${upd.text}`);
+      }
+
+      const tagRes = await addTagsInRespond({ phoneE164, tags: tagsToAdd });
+      if (!tagRes.ok) throw new Error(`Add tags failed HTTP ${tagRes.status} ${tagRes.text}`);
+
+      const contactId = contactIdFromJson(tagRes.json);
+
+      await upsertMappingAndState({
+        userId,
+        respondContactId: contactId,
+        phoneE164,
+        roleTag,
+        groupTag,
+        cnmTag,
+        tierTag,
+        profilePicUrl
+      });
+
+      ok += 1;
+      console.log(`OK tag_drift user_id=${userId} phone=${phoneE164}`);
+    } catch (e) {
+      fail += 1;
+      console.log(`FAIL tag_drift user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
+    }
+
+    await sleep(perContactPaceMs);
+  }
+
+  console.log(`Tag drift updates finished processed=${updates.length} ok=${ok} fail=${fail}`);
+}
+
 async function main() {
   console.log("Worker start");
   await runJoiners();
   if (!shuttingDown) await runProfilePicUpdates();
+  if (!shuttingDown) await runTagDriftUpdates();
 
   await pool.end();
 
