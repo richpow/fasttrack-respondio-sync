@@ -39,21 +39,18 @@ const pool = new Pool({
   ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : undefined
 });
 
-function respondHeaders() {
+function respondHeaders(acceptOverride) {
   return {
-    Accept: "application/json",
+    Accept: acceptOverride || "application/json",
     Authorization: `Bearer ${env("RESPOND_IO_TOKEN")}`,
     "Content-Type": "application/json"
   };
 }
 
-async function httpJson(method, url, body, acceptHeaderOverride) {
-  const headers = respondHeaders();
-  if (acceptHeaderOverride) headers.Accept = acceptHeaderOverride;
-
+async function http(method, url, body, acceptOverride) {
   const res = await fetch(url, {
     method,
-    headers,
+    headers: respondHeaders(acceptOverride),
     body: body !== undefined ? JSON.stringify(body) : undefined
   });
 
@@ -65,22 +62,16 @@ async function httpJson(method, url, body, acceptHeaderOverride) {
     json = null;
   }
 
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${text}`);
-  }
-
-  return json;
+  return { ok: res.ok, status: res.status, text, json };
 }
 
-function buildUrl(templateEnvVar, phoneE164) {
+function urlWithPhone(templateEnvVar, phoneE164) {
   const baseUrl = env(templateEnvVar);
   const identifier = `phone:${phoneE164}`;
   return baseUrl.replace("{identifier}", identifier);
 }
 
-async function createContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
-  const url = buildUrl("RESPOND_IO_CREATE_CONTACT_URL", phoneE164);
-
+function buildContactBody({ phoneE164, firstName, profilePicUrl, customFields }) {
   const body = {
     firstName,
     phone: phoneE164,
@@ -91,20 +82,65 @@ async function createContactInRespond({ phoneE164, firstName, profilePicUrl, cus
     body.profilePic = profilePicUrl.trim();
   }
 
-  return httpJson("POST", url, body);
+  return body;
+}
+
+async function updateContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
+  const url = urlWithPhone("RESPOND_IO_UPDATE_CONTACT_URL", phoneE164);
+  const body = buildContactBody({ phoneE164, firstName, profilePicUrl, customFields });
+
+  const res = await http("PUT", url, body, "application/json, application/xml, multipart/form-data");
+
+  if (res.ok) {
+    const contactId =
+      res.json && (typeof res.json.contactId === "number" || typeof res.json.contactId === "string")
+        ? Number(res.json.contactId)
+        : 0;
+    return { updated: true, contactId, response: res.json };
+  }
+
+  return { updated: false, status: res.status, text: res.text, response: res.json };
+}
+
+async function createContactInRespond({ phoneE164, firstName, profilePicUrl, customFields }) {
+  const url = urlWithPhone("RESPOND_IO_CREATE_CONTACT_URL", phoneE164);
+  const body = buildContactBody({ phoneE164, firstName, profilePicUrl, customFields });
+
+  const res = await http("POST", url, body, "application/json");
+
+  if (res.ok) {
+    return { created: true, response: res.json };
+  }
+
+  if (res.status === 403 && isNonEmptyString(res.text) && res.text.includes("Contact already exist")) {
+    return { created: false, alreadyExists: true, response: res.json };
+  }
+
+  throw new Error(`Create failed HTTP ${res.status} ${res.text}`);
 }
 
 async function addTagsInRespond({ phoneE164, tags }) {
-  const url = buildUrl("RESPOND_IO_ADD_TAGS_URL", phoneE164);
+  const url = urlWithPhone("RESPOND_IO_ADD_TAGS_URL", phoneE164);
 
   const payload = uniqueStrings(tags);
-  if (payload.length < 1) return null;
+  if (payload.length < 1) return { contactId: 0 };
 
   if (payload.length > 10) {
     throw new Error(`Tag limit exceeded. Got ${payload.length} tags, respond.io allows max 10.`);
   }
 
-  return httpJson("POST", url, payload, "application/json, application/xml, multipart/form-data");
+  const res = await http("POST", url, payload, "application/json, application/xml, multipart/form-data");
+
+  if (!res.ok) {
+    throw new Error(`Add tags failed HTTP ${res.status} ${res.text}`);
+  }
+
+  const contactId =
+    res.json && (typeof res.json.contactId === "number" || typeof res.json.contactId === "string")
+      ? Number(res.json.contactId)
+      : 0;
+
+  return { contactId, response: res.json };
 }
 
 async function fetchJoiners(limit) {
@@ -200,7 +236,6 @@ async function main() {
   for (const r of joiners) {
     const userId = r.user_id;
     const phoneE164 = r.phone_e164;
-
     const firstName = safeString(r.tiktok_username) || `user_${userId}`;
 
     const customFields = [
@@ -210,6 +245,8 @@ async function main() {
       { name: "agency_status", value: safeString(r.agency_status) }
     ];
 
+    const profilePicUrl = safeString(r.profile_pic_url);
+
     const roleTag = r.role_tag;
     const groupTag = r.group_tag;
     const cnmTag = r.creator_network_manager_tag;
@@ -218,28 +255,33 @@ async function main() {
     const tagsToAdd = [roleTag, groupTag, cnmTag, tierTag];
 
     try {
-      const createResp = await createContactInRespond({
+      const upd = await updateContactInRespond({
         phoneE164,
         firstName,
-        profilePicUrl: r.profile_pic_url,
+        profilePicUrl,
         customFields
       });
 
-      await sleep(delayMs);
+      if (!upd.updated) {
+        const created = await createContactInRespond({
+          phoneE164,
+          firstName,
+          profilePicUrl,
+          customFields
+        });
 
-      const tagResp = await addTagsInRespond({
-        phoneE164,
-        tags: tagsToAdd
-      });
+        await sleep(delayMs);
 
-      const respondContactId =
-        (tagResp && (tagResp.contactId ?? tagResp.contactID)) !== undefined
-          ? (tagResp.contactId ?? tagResp.contactID)
-          : 0;
+        if (!created.created && !created.alreadyExists) {
+          throw new Error("Create did not succeed and did not report already exists");
+        }
+      }
+
+      const tagInfo = await addTagsInRespond({ phoneE164, tags: tagsToAdd });
 
       await upsertNeonMapping({
         userId,
-        respondContactId,
+        respondContactId: tagInfo.contactId,
         phoneE164,
         roleTag,
         groupTag,
@@ -248,9 +290,7 @@ async function main() {
       });
 
       ok += 1;
-      console.log(
-        `OK user_id=${userId} phone=${phoneE164} contact_id=${respondContactId} profile_pic=${safeString(r.profile_pic_url)} create=${JSON.stringify(createResp)} tags=${JSON.stringify(tagResp)}`
-      );
+      console.log(`OK user_id=${userId} phone=${phoneE164} updated=${upd.updated ? "true" : "false"} contact_id=${tagInfo.contactId}`);
     } catch (e) {
       fail += 1;
       console.log(`FAIL user_id=${userId} phone=${phoneE164} err=${String(e.message || e)}`);
