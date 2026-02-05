@@ -26,6 +26,13 @@ function s(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 
+function normalizeText(v) {
+  const txt = s(v);
+  if (!txt) return "";
+  if (txt.toUpperCase() === "N/A") return "";
+  return txt;
+}
+
 function sleepMs(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -208,7 +215,6 @@ async function fetchRows(limit) {
         user_id,
         phone_e164,
         tiktok_username,
-        creator_id,
         agency_status,
         role_tag,
         group_raw,
@@ -238,11 +244,8 @@ function dedupeByPhone(rows) {
     if (!phone) continue;
 
     const current = byPhone.get(phone);
-    if (!current) {
-      byPhone.set(phone, { phone, rows: [r] });
-    } else {
-      current.rows.push(r);
-    }
+    if (!current) byPhone.set(phone, { phone, rows: [r] });
+    else current.rows.push(r);
   }
 
   const out = [];
@@ -286,10 +289,6 @@ async function main() {
     const phone = item.phone;
 
     try {
-      if (item.dupCount > 1) {
-        log("DUP phone", phone, "rows=" + item.dupCount, "chosen_user_id=" + userId, "action=" + item.action);
-      }
-
       if (item.action === "delete") {
         const del = await respondDeleteContact(token, phone);
         const treatMissingOk = del.status === 400 || del.status === 404;
@@ -304,11 +303,11 @@ async function main() {
         continue;
       }
 
-      const tiktok = s(r.tiktok_username);
-      const roleTag = s(r.role_tag);
+      const tiktok = normalizeText(r.tiktok_username);
+      const roleTag = normalizeText(r.role_tag);
 
-      const groupValue = extractInsideParens(s(r.group_raw));
-      const managerValue = emailLocalPart(s(r.manager_raw));
+      const groupValue = extractInsideParens(normalizeText(r.group_raw));
+      const managerValue = emailLocalPart(normalizeText(r.manager_raw));
 
       const diamondsMtd = formatNumber(r.diamonds_mtd);
       const validDaysMtd = formatNumber(r.valid_days_mtd);
@@ -318,6 +317,7 @@ async function main() {
       const firstName = tiktok ? tiktok : "user_" + String(userId);
 
       const customFields = [
+        { name: "tiktok_username", value: tiktok || null },
         { name: "group", value: groupValue || null },
         { name: "manager", value: managerValue || null },
         { name: "diamonds_mtd", value: diamondsMtd },
@@ -354,7 +354,7 @@ async function main() {
           throw new Error("Delete tier tags failed HTTP " + dt.status + " " + dt.text);
         }
 
-        const tierTag = s(r.tier_tag);
+        const tierTag = normalizeText(r.tier_tag);
         if (tierTag) {
           const at = await respondAddTags(token, phone, [tierTag]);
           if (!at.ok) {
