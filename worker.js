@@ -97,13 +97,10 @@ function hoursDecimalToHhMm(v) {
 function toDayMonth(v) {
   const txt = s(v);
   if (!txt) return "";
-
   const d = new Date(txt);
   if (Number.isNaN(d.getTime())) return "";
-
   const day = d.getUTCDate();
   const month = d.toLocaleString("en-GB", { month: "short", timeZone: "UTC" });
-
   return String(day) + " " + month;
 }
 
@@ -121,7 +118,6 @@ async function httpCall(method, url, token, body) {
     headers: respondHeaders(token),
     body: body === undefined ? undefined : JSON.stringify(body)
   });
-
   const text = await res.text();
   return { ok: res.ok, status: res.status, text };
 }
@@ -132,7 +128,6 @@ async function withQueueRetry(fn) {
   const maxDelay = Number(envOptional("RESPOND_IO_RETRY_MAX_MS", "30000"));
 
   let attempt = 0;
-
   while (true) {
     attempt += 1;
 
@@ -215,6 +210,7 @@ async function fetchRows(limit) {
         user_id,
         phone_e164,
         tiktok_username,
+        real_first_name,
         agency_status,
         role_tag,
         group_raw,
@@ -257,10 +253,10 @@ function dedupeByPhone(rows) {
         .filter((x) => s(x.agency_status) === "in_agency")
         .sort((a, b) => Number(b.user_id) - Number(a.user_id))[0];
 
-      out.push({ action: "sync", row: best, phone: entry.phone, dupCount: entry.rows.length });
+      out.push({ action: "sync", row: best, phone: entry.phone });
     } else {
       const best = entry.rows.sort((a, b) => Number(b.user_id) - Number(a.user_id))[0];
-      out.push({ action: "delete", row: best, phone: entry.phone, dupCount: entry.rows.length });
+      out.push({ action: "delete", row: best, phone: entry.phone });
     }
   }
 
@@ -272,8 +268,8 @@ async function main() {
   log("BOOT worker start");
 
   const token = envRequired("RESPOND_IO_TOKEN");
-  const limit = Number(envOptional("SYNC_LIMIT", "5000"));
-  const paceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS", "800"));
+  const limit = Number(envOptional("SYNC_LIMIT", "100000"));
+  const paceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS", "900"));
 
   const tierUniverse = uniq(s(envOptional("TIER_TAGS_CSV", "")).split(",").map((x) => s(x))).filter((x) => x);
 
@@ -304,6 +300,7 @@ async function main() {
       }
 
       const tiktok = normalizeText(r.tiktok_username);
+      const realFirst = normalizeText(r.real_first_name);
       const roleTag = normalizeText(r.role_tag);
 
       const groupValue = extractInsideParens(normalizeText(r.group_raw));
@@ -318,6 +315,7 @@ async function main() {
 
       const customFields = [
         { name: "tiktok_username", value: tiktok || null },
+        { name: "real_first_name", value: realFirst || null },
         { name: "group", value: groupValue || null },
         { name: "manager", value: managerValue || null },
         { name: "diamonds_mtd", value: diamondsMtd },
