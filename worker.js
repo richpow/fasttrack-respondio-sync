@@ -82,7 +82,7 @@ function emailLocalPart(v) {
 function formatNumber(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return "0";
-  return new Intl.NumberFormat("en-GB").format(Math.trunc(n));
+  return new Intl.NumberFormat("en").format(Math.trunc(n));
 }
 
 function hoursDecimalToHhMm(v) {
@@ -94,14 +94,37 @@ function hoursDecimalToHhMm(v) {
   return String(h) + "h " + String(m) + "m";
 }
 
+function ordinalSuffix(day) {
+  const d = Number(day);
+  if (!Number.isFinite(d)) return "th";
+  const mod100 = d % 100;
+  if (mod100 >= 11 && mod100 <= 13) return "th";
+  const mod10 = d % 10;
+  if (mod10 === 1) return "st";
+  if (mod10 === 2) return "nd";
+  if (mod10 === 3) return "rd";
+  return "th";
+}
+
 function toDayMonth(v) {
-  const txt = s(v);
-  if (!txt) return "";
-  const d = new Date(txt);
+  if (!v) return "";
+
+  let d;
+  if (v instanceof Date) {
+    d = v;
+  } else {
+    const txt = typeof v === "string" ? v.trim() : "";
+    if (!txt) return "";
+    d = new Date(txt);
+  }
+
   if (Number.isNaN(d.getTime())) return "";
+
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const day = d.getUTCDate();
-  const month = d.toLocaleString("en-GB", { month: "short", timeZone: "UTC" });
-  return String(day) + " " + month;
+  const month = months[d.getUTCMonth()] || "";
+  if (!month) return "";
+  return String(day) + ordinalSuffix(day) + " " + month;
 }
 
 function respondHeaders(token) {
@@ -202,21 +225,6 @@ const pool = new Pool({
   ssl: envOptional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
 });
 
-function tierUniverseHardcoded() {
-  return [
-    "Tier 1",
-    "Tier 2",
-    "Tier 3 (Mature)",
-    "Tier 4",
-    "Tier 5 (Pre top)",
-    "Tier 6",
-    "Tier 7",
-    "Tier 8 (Top)",
-    "Tier 9",
-    "Tier 10"
-  ];
-}
-
 async function fetchRows(limit) {
   const client = await pool.connect();
   try {
@@ -231,7 +239,6 @@ async function fetchRows(limit) {
         group_raw,
         manager_raw,
         tier_tag,
-        tier,
         profile_pic_url,
         stats_as_of,
         diamonds_mtd,
@@ -280,24 +287,6 @@ function dedupeByPhone(rows) {
   return out;
 }
 
-function buildUniversesFromRows(rows) {
-  const groupTags = [];
-  const managerTags = [];
-
-  for (const r of rows) {
-    const g = extractInsideParens(normalizeText(r.group_raw));
-    const m = emailLocalPart(normalizeText(r.manager_raw));
-    if (g) groupTags.push("Group " + g);
-    if (m) managerTags.push("Manager " + m);
-  }
-
-  return {
-    groupTagUniverse: uniq(groupTags),
-    managerTagUniverse: uniq(managerTags),
-    tierTagUniverse: tierUniverseHardcoded()
-  };
-}
-
 async function main() {
   log("BOOT worker start");
 
@@ -305,10 +294,10 @@ async function main() {
   const limit = Number(envOptional("SYNC_LIMIT", "100000"));
   const paceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS", "900"));
 
+  const tierUniverse = uniq(s(envOptional("TIER_TAGS_CSV", "")).split(",").map((x) => s(x))).filter((x) => x);
+
   const rows = await fetchRows(limit);
   const work = dedupeByPhone(rows);
-
-  const universes = buildUniversesFromRows(rows);
 
   let ok = 0;
   let fail = 0;
@@ -345,9 +334,6 @@ async function main() {
       const liveDurationMtd = hoursDecimalToHhMm(r.live_duration_mtd_hours);
       const statsAsOf = toDayMonth(r.stats_as_of);
 
-      const tierTag = normalizeText(r.tier_tag);
-      const tierField = normalizeText(r.tier) || tierTag;
-
       const firstName = tiktok ? tiktok : "user_" + String(userId);
 
       const customFields = [
@@ -355,7 +341,6 @@ async function main() {
         { name: "real_first_name", value: realFirst || null },
         { name: "group", value: groupValue || null },
         { name: "manager", value: managerValue || null },
-        { name: "tier", value: tierField || null },
         { name: "diamonds_mtd", value: diamondsMtd },
         { name: "valid_days_mtd", value: validDaysMtd },
         { name: "live_duration_mtd", value: liveDurationMtd },
@@ -384,39 +369,18 @@ async function main() {
         }
       }
 
-      const dt = await respondDeleteTags(token, phone, universes.tierTagUniverse);
-      if (!dt.ok) {
-        throw new Error("Delete tier tags failed HTTP " + dt.status + " " + dt.text);
-      }
-
-      if (tierTag) {
-        const at = await respondAddTags(token, phone, [tierTag]);
-        if (!at.ok) {
-          throw new Error("Add tier tag failed HTTP " + at.status + " " + at.text);
+      if (tierUniverse.length > 0) {
+        const dt = await respondDeleteTags(token, phone, tierUniverse);
+        if (!dt.ok) {
+          throw new Error("Delete tier tags failed HTTP " + dt.status + " " + dt.text);
         }
-      }
 
-      const dg = await respondDeleteTags(token, phone, universes.groupTagUniverse);
-      if (!dg.ok) {
-        throw new Error("Delete group tags failed HTTP " + dg.status + " " + dg.text);
-      }
-
-      if (groupValue) {
-        const ag = await respondAddTags(token, phone, ["Group " + groupValue]);
-        if (!ag.ok) {
-          throw new Error("Add group tag failed HTTP " + ag.status + " " + ag.text);
-        }
-      }
-
-      const dm = await respondDeleteTags(token, phone, universes.managerTagUniverse);
-      if (!dm.ok) {
-        throw new Error("Delete manager tags failed HTTP " + dm.status + " " + dm.text);
-      }
-
-      if (managerValue) {
-        const am = await respondAddTags(token, phone, ["Manager " + managerValue]);
-        if (!am.ok) {
-          throw new Error("Add manager tag failed HTTP " + am.status + " " + am.text);
+        const tierTag = normalizeText(r.tier_tag);
+        if (tierTag) {
+          const at = await respondAddTags(token, phone, [tierTag]);
+          if (!at.ok) {
+            throw new Error("Add tier tag failed HTTP " + at.status + " " + at.text);
+          }
         }
       }
 
