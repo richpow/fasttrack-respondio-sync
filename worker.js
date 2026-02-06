@@ -220,6 +220,14 @@ async function respondDeleteTags(token, phoneE164, tags) {
   return { ok: true, status: 200, text: "" };
 }
 
+async function respondUpdateLifecycle(token, phoneE164, lifecycleName) {
+  const base = envRequired("RESPOND_IO_UPDATE_LIFECYCLE_URL");
+  const url = urlWithPhone(base, phoneE164);
+
+  const body = { name: s(lifecycleName) ? s(lifecycleName) : "" };
+  return await withQueueRetry(() => httpCall("POST", url, token, body));
+}
+
 const pool = new Pool({
   connectionString: envRequired("DATABASE_URL"),
   ssl: envOptional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
@@ -243,7 +251,8 @@ async function fetchRows(limit) {
         stats_as_of,
         diamonds_mtd,
         valid_days_mtd,
-        live_duration_mtd_hours
+        live_duration_mtd_hours,
+        lifecycle
       FROM v_respond_sync_users
       ORDER BY user_id
       LIMIT $1
@@ -381,6 +390,14 @@ async function main() {
           if (!at.ok) {
             throw new Error("Add tier tag failed HTTP " + at.status + " " + at.text);
           }
+        }
+      }
+
+      const lifecycle = normalizeText(r.lifecycle);
+      if (lifecycle) {
+        const lc = await respondUpdateLifecycle(token, phone, lifecycle);
+        if (!lc.ok) {
+          throw new Error("Update lifecycle failed HTTP " + lc.status + " " + lc.text);
         }
       }
 
