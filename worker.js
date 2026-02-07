@@ -82,7 +82,7 @@ function emailLocalPart(v) {
 function formatNumber(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return "0";
-  return new Intl.NumberFormat("en").format(Math.trunc(n));
+  return new Intl.NumberFormat("en-GB").format(Math.trunc(n));
 }
 
 function hoursDecimalToHhMm(v) {
@@ -228,6 +228,29 @@ async function respondUpdateLifecycle(token, phoneE164, lifecycleName) {
   return await withQueueRetry(() => httpCall("POST", url, token, body));
 }
 
+function tierUniverse() {
+  const canonical = [
+    "Tier 1",
+    "Tier 2",
+    "Tier 3 (Mature)",
+    "Tier 4",
+    "Tier 5 (Pre top)",
+    "Tier 6",
+    "Tier 7",
+    "Tier 8 (Top)",
+    "Tier 9",
+    "Tier 10"
+  ];
+
+  const fromEnv = uniq(
+    s(envOptional("TIER_TAGS_CSV", ""))
+      .split(",")
+      .map((x) => s(x))
+  );
+
+  return uniq(canonical.concat(fromEnv));
+}
+
 const pool = new Pool({
   connectionString: envRequired("DATABASE_URL"),
   ssl: envOptional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
@@ -303,7 +326,7 @@ async function main() {
   const limit = Number(envOptional("SYNC_LIMIT", "100000"));
   const paceMs = Number(envOptional("RESPOND_IO_PER_CONTACT_PACE_MS", "900"));
 
-  const tierUniverse = uniq(s(envOptional("TIER_TAGS_CSV", "")).split(",").map((x) => s(x))).filter((x) => x);
+  const allTierTags = tierUniverse();
 
   const rows = await fetchRows(limit);
   const work = dedupeByPhone(rows);
@@ -334,6 +357,8 @@ async function main() {
       const tiktok = normalizeText(r.tiktok_username);
       const realFirst = normalizeText(r.real_first_name);
       const roleTag = normalizeText(r.role_tag);
+      const tierTag = normalizeText(r.tier_tag);
+      const lifecycle = normalizeText(r.lifecycle);
 
       const groupValue = extractInsideParens(normalizeText(r.group_raw));
       const managerValue = emailLocalPart(normalizeText(r.manager_raw));
@@ -350,6 +375,7 @@ async function main() {
         { name: "real_first_name", value: realFirst || null },
         { name: "group", value: groupValue || null },
         { name: "manager", value: managerValue || null },
+        { name: "tier", value: tierTag || null },
         { name: "diamonds_mtd", value: diamondsMtd },
         { name: "valid_days_mtd", value: validDaysMtd },
         { name: "live_duration_mtd", value: liveDurationMtd },
@@ -378,13 +404,12 @@ async function main() {
         }
       }
 
-      if (tierUniverse.length > 0) {
-        const dt = await respondDeleteTags(token, phone, tierUniverse);
+      if (allTierTags.length > 0) {
+        const dt = await respondDeleteTags(token, phone, allTierTags);
         if (!dt.ok) {
           throw new Error("Delete tier tags failed HTTP " + dt.status + " " + dt.text);
         }
 
-        const tierTag = normalizeText(r.tier_tag);
         if (tierTag) {
           const at = await respondAddTags(token, phone, [tierTag]);
           if (!at.ok) {
@@ -393,16 +418,13 @@ async function main() {
         }
       }
 
-      const lifecycle = normalizeText(r.lifecycle);
-      if (lifecycle) {
-        const lc = await respondUpdateLifecycle(token, phone, lifecycle);
-        if (!lc.ok) {
-          throw new Error("Update lifecycle failed HTTP " + lc.status + " " + lc.text);
-        }
+      const lc = await respondUpdateLifecycle(token, phone, lifecycle);
+      if (!lc.ok) {
+        throw new Error("Update lifecycle failed HTTP " + lc.status + " " + lc.text);
       }
 
       ok += 1;
-      log("OK sync", phone);
+      log("OK sync", phone, "tier=" + (tierTag || ""), "lifecycle=" + (lifecycle || ""));
     } catch (e) {
       fail += 1;
       log("FAIL", "user_id=" + userId, "phone=" + phone, "err=" + String(e && e.message ? e.message : e));
