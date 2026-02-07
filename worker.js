@@ -251,6 +251,43 @@ function tierUniverse() {
   return uniq(canonical.concat(fromEnv));
 }
 
+function tierRankFromTierTag(tierTag) {
+  const t = normalizeText(tierTag);
+
+  if (t.startsWith("Tier 10")) return 10;
+  if (t.startsWith("Tier 9")) return 9;
+  if (t.startsWith("Tier 8")) return 8;
+  if (t.startsWith("Tier 7")) return 7;
+  if (t.startsWith("Tier 6")) return 6;
+  if (t.startsWith("Tier 5")) return 5;
+  if (t.startsWith("Tier 4")) return 4;
+  if (t.startsWith("Tier 3")) return 3;
+  if (t.startsWith("Tier 2")) return 2;
+  return 1;
+}
+
+function tierRankFromDiamonds(d) {
+  const n = Number(d);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+
+  if (n >= 5000000) return 10;
+  if (n >= 2500000) return 9;
+  if (n >= 1600000) return 8;
+  if (n >= 1000000) return 7;
+  if (n >= 700000) return 6;
+  if (n >= 500000) return 5;
+  if (n >= 300000) return 4;
+  if (n >= 200000) return 3;
+  if (n >= 100000) return 2;
+  return 1;
+}
+
+function tierStatusFromRanks(prevRank, currentMonthRank) {
+  if (currentMonthRank > prevRank) return "Upgrading";
+  if (currentMonthRank < prevRank) return "Downgrading";
+  return "Retained";
+}
+
 const pool = new Pool({
   connectionString: envRequired("DATABASE_URL"),
   ssl: envOptional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
@@ -357,16 +394,21 @@ async function main() {
       const tiktok = normalizeText(r.tiktok_username);
       const realFirst = normalizeText(r.real_first_name);
       const roleTag = normalizeText(r.role_tag);
-      const tierTag = normalizeText(r.tier_tag);
+      const tierTag = normalizeText(r.tier_tag) || "Tier 1";
       const lifecycle = normalizeText(r.lifecycle);
 
       const groupValue = extractInsideParens(normalizeText(r.group_raw));
       const managerValue = emailLocalPart(normalizeText(r.manager_raw));
 
+      const diamondsMtdRaw = Number(r.diamonds_mtd);
       const diamondsMtd = formatNumber(r.diamonds_mtd);
       const validDaysMtd = formatNumber(r.valid_days_mtd);
       const liveDurationMtd = hoursDecimalToHhMm(r.live_duration_mtd_hours);
       const statsAsOf = toDayMonth(r.stats_as_of);
+
+      const prevTierRank = tierRankFromTierTag(tierTag);
+      const currentMonthTierRank = tierRankFromDiamonds(diamondsMtdRaw);
+      const tierStatus = tierStatusFromRanks(prevTierRank, currentMonthTierRank);
 
       const firstName = tiktok ? tiktok : "user_" + String(userId);
 
@@ -376,6 +418,7 @@ async function main() {
         { name: "group", value: groupValue || null },
         { name: "manager", value: managerValue || null },
         { name: "tier", value: tierTag || null },
+        { name: "tier_status", value: tierStatus },
         { name: "diamonds_mtd", value: diamondsMtd },
         { name: "valid_days_mtd", value: validDaysMtd },
         { name: "live_duration_mtd", value: liveDurationMtd },
@@ -424,7 +467,7 @@ async function main() {
       }
 
       ok += 1;
-      log("OK sync", phone, "tier=" + (tierTag || ""), "lifecycle=" + (lifecycle || ""));
+      log("OK sync", phone, "tier=" + tierTag, "tier_status=" + tierStatus, "lifecycle=" + (lifecycle || ""));
     } catch (e) {
       fail += 1;
       log("FAIL", "user_id=" + userId, "phone=" + phone, "err=" + String(e && e.message ? e.message : e));
