@@ -288,6 +288,22 @@ function tierStatusFromRanks(prevRank, currentMonthRank) {
   return "Retained";
 }
 
+/**
+ * Canonicalise Respond identifier.
+ * Always return "+<digits>".
+ * Examples:
+ * "+4474 123 45678" -> "+447412345678"
+ * "447412345678" -> "+447412345678"
+ * "07412 345678" -> "+07412345678" (still wrong country wise, but stable identifier)
+ */
+function normalizePhoneE164(v) {
+  const raw = s(v);
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  return "+" + digits;
+}
+
 const pool = new Pool({
   connectionString: envRequired("DATABASE_URL"),
   ssl: envOptional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
@@ -328,7 +344,7 @@ function dedupeByPhone(rows) {
   const byPhone = new Map();
 
   for (const r of rows) {
-    const phone = s(r.phone_e164);
+    const phone = normalizePhoneE164(r.phone_e164);
     if (!phone) continue;
 
     const current = byPhone.get(phone);
