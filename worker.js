@@ -1,4 +1,6 @@
 import pg from "pg";
+import http from "http";
+import { URL } from "url";
 
 const { Pool } = pg;
 
@@ -125,6 +127,21 @@ function toDayMonth(v) {
   const month = months[d.getUTCMonth()] || "";
   if (!month) return "";
   return String(day) + ordinalSuffix(day) + " " + month;
+}
+
+/**
+ * Canonicalise the Respond identifier.
+ * Always returns "+<digits>".
+ * Examples:
+ * "+4474 123 45678" -> "+447412345678"
+ * "447412345678" -> "+447412345678"
+ */
+function normalizePhoneE164(v) {
+  const raw = s(v);
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  return "+" + digits;
 }
 
 function respondHeaders(token) {
@@ -288,22 +305,6 @@ function tierStatusFromRanks(prevRank, currentMonthRank) {
   return "Retained";
 }
 
-/**
- * Canonicalise Respond identifier.
- * Always return "+<digits>".
- * Examples:
- * "+4474 123 45678" -> "+447412345678"
- * "447412345678" -> "+447412345678"
- * "07412 345678" -> "+07412345678" (still wrong country wise, but stable identifier)
- */
-function normalizePhoneE164(v) {
-  const raw = s(v);
-  if (!raw) return "";
-  const digits = raw.replace(/\D/g, "");
-  if (!digits) return "";
-  return "+" + digits;
-}
-
 const pool = new Pool({
   connectionString: envRequired("DATABASE_URL"),
   ssl: envOptional("DATABASE_SSL", "false") === "true" ? { rejectUnauthorized: false } : undefined
@@ -372,8 +373,8 @@ function dedupeByPhone(rows) {
   return out;
 }
 
-async function main() {
-  log("BOOT worker start");
+async function runSyncOnce() {
+  log("RUN start");
 
   const token = envRequired("RESPOND_IO_TOKEN");
   const limit = Number(envOptional("SYNC_LIMIT", "100000"));
@@ -492,9 +493,88 @@ async function main() {
     await sleepMs(paceMs);
   }
 
-  log("Summary", "phones=" + work.length, "ok=" + ok, "fail=" + fail);
-  await pool.end();
-  log("Worker completed");
+  log("RUN summary", "phones=" + work.length, "ok=" + ok, "fail=" + fail);
+  log("RUN end");
+
+  return { phones: work.length, ok, fail };
+}
+
+let isRunning = false;
+let lastRun = null;
+
+async function runGuarded() {
+  if (isRunning) return { status: "already_running", lastRun };
+  isRunning = true;
+  try {
+    const startedAt = nowIso();
+    const result = await runSyncOnce();
+    lastRun = { startedAt, finishedAt: nowIso(), ...result };
+    return { status: "started", lastRun };
+  } finally {
+    isRunning = false;
+  }
+}
+
+function readBodyJson(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 1024 * 1024) {
+        reject(new Error("Body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (!data) return resolve({});
+      try {
+        resolve(JSON.parse(data));
+      } catch (e) {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+  });
+}
+
+function sendJson(res, statusCode, obj) {
+  const payload = JSON.stringify(obj);
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Length", Buffer.byteLength(payload));
+  res.end(payload);
+}
+
+async function handleRequest(req, res) {
+  const urlObj = new URL(req.url || "/", "http://localhost");
+  const path = urlObj.pathname || "/";
+  const method = (req.method || "GET").toUpperCase();
+
+  if (method === "GET" && path === "/health") {
+    return sendJson(res, 200, { ok: true, running: isRunning, lastRun });
+  }
+
+  if (method === "POST" && path === "/run") {
+    try {
+      await readBodyJson(req);
+      const out = await runGuarded();
+      return sendJson(res, 200, out);
+    } catch (e) {
+      return sendJson(res, 500, { status: "error", error: String(e && e.message ? e.message : e) });
+    }
+  }
+
+  return sendJson(res, 404, { ok: false, error: "Not found" });
+}
+
+async function main() {
+  const port = Number(process.env.PORT || "8080");
+  const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch((e) => {
+      sendJson(res, 500, { status: "error", error: String(e && e.message ? e.message : e) });
+    });
+  });
+
+  server.listen(port, () => log("Worker API listening", "port=" + port));
 }
 
 main().catch((e) => {
