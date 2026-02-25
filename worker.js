@@ -132,9 +132,6 @@ function toDayMonth(v) {
 /**
  * Canonicalise the Respond identifier.
  * Always returns "+<digits>".
- * Examples:
- * "+4474 123 45678" -> "+447412345678"
- * "447412345678" -> "+447412345678"
  */
 function normalizePhoneE164(v) {
   const raw = s(v);
@@ -329,8 +326,10 @@ async function fetchRows(limit) {
         diamonds_mtd,
         valid_days_mtd,
         live_duration_mtd_hours,
-        lifecycle
-      FROM v_respond_sync_users
+        lifecycle,
+        fasttrack_tier,
+        moving_to
+      FROM v_respond_sync_users_plus_leagues
       ORDER BY user_id
       LIMIT $1
     `;
@@ -414,6 +413,9 @@ async function runSyncOnce() {
       const tierTag = normalizeText(r.tier_tag) || "Tier 1";
       const lifecycle = normalizeText(r.lifecycle);
 
+      const fasttrackTier = normalizeText(r.fasttrack_tier);
+      const movingTo = normalizeText(r.moving_to);
+
       const groupValue = extractInsideParens(normalizeText(r.group_raw));
       const managerValue = emailLocalPart(normalizeText(r.manager_raw));
 
@@ -440,7 +442,9 @@ async function runSyncOnce() {
         { name: "valid_days_mtd", value: validDaysMtd },
         { name: "live_duration_mtd", value: liveDurationMtd },
         { name: "stats_as_of", value: statsAsOf || null },
-        { name: "agency_status", value: "in_agency" }
+        { name: "agency_status", value: "in_agency" },
+        { name: "fasttrack_tier", value: fasttrackTier || null },
+        { name: "moving_to", value: movingTo || null }
       ];
 
       const cu = await respondCreateOrUpdate(token, phone, firstName, s(r.profile_pic_url), customFields);
@@ -484,7 +488,15 @@ async function runSyncOnce() {
       }
 
       ok += 1;
-      log("OK sync", phone, "tier=" + tierTag, "tier_status=" + tierStatus, "lifecycle=" + (lifecycle || ""));
+      log(
+        "OK sync",
+        phone,
+        "tier=" + tierTag,
+        "tier_status=" + tierStatus,
+        "lifecycle=" + (lifecycle || ""),
+        "fasttrack_tier=" + (fasttrackTier || ""),
+        "moving_to=" + (movingTo || "")
+      );
     } catch (e) {
       fail += 1;
       log("FAIL", "user_id=" + userId, "phone=" + phone, "err=" + String(e && e.message ? e.message : e));
@@ -529,7 +541,7 @@ function readBodyJson(req) {
       if (!data) return resolve({});
       try {
         resolve(JSON.parse(data));
-      } catch (e) {
+      } catch {
         reject(new Error("Invalid JSON body"));
       }
     });
