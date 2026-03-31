@@ -35,6 +35,19 @@ function normalizeText(v) {
   return txt;
 }
 
+function normalizeAgencyStatus(v) {
+  return normalizeText(v).toLowerCase();
+}
+
+function isDeletedAgencyStatus(v) {
+  const status = normalizeAgencyStatus(v);
+  return status === "quit" || status === "left_agency";
+}
+
+function isInAgencyStatus(v) {
+  return normalizeAgencyStatus(v) === "in_agency";
+}
+
 function sleepMs(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -353,19 +366,24 @@ function dedupeByPhone(rows) {
   }
 
   const out = [];
+
   for (const entry of byPhone.values()) {
-    const anyInAgency = entry.rows.some((x) => s(x.agency_status) === "in_agency");
+    const rowsSortedDesc = entry.rows.slice().sort((a, b) => Number(b.user_id) - Number(a.user_id));
+    const latest = rowsSortedDesc[0];
 
-    if (anyInAgency) {
-      const best = entry.rows
-        .filter((x) => s(x.agency_status) === "in_agency")
-        .sort((a, b) => Number(b.user_id) - Number(a.user_id))[0];
-
-      out.push({ action: "sync", row: best, phone: entry.phone });
-    } else {
-      const best = entry.rows.sort((a, b) => Number(b.user_id) - Number(a.user_id))[0];
-      out.push({ action: "delete", row: best, phone: entry.phone });
+    if (isDeletedAgencyStatus(latest.agency_status)) {
+      out.push({ action: "delete", row: latest, phone: entry.phone });
+      continue;
     }
+
+    const inAgencyRows = rowsSortedDesc.filter((x) => isInAgencyStatus(x.agency_status));
+
+    if (inAgencyRows.length > 0) {
+      out.push({ action: "sync", row: inAgencyRows[0], phone: entry.phone });
+      continue;
+    }
+
+    out.push({ action: "delete", row: latest, phone: entry.phone });
   }
 
   out.sort((a, b) => Number(a.row.user_id) - Number(b.row.user_id));
@@ -402,7 +420,7 @@ async function runSyncOnce() {
         }
 
         ok += 1;
-        log("OK delete", phone);
+        log("OK delete", phone, "agency_status=" + normalizeText(r.agency_status));
         await sleepMs(paceMs);
         continue;
       }
@@ -411,7 +429,7 @@ async function runSyncOnce() {
       const realFirst = normalizeText(r.real_first_name);
       const roleTag = normalizeText(r.role_tag);
       const tierTag = normalizeText(r.tier_tag) || "Tier 1";
-      const lifecycle = normalizeText(r.lifecycle);
+      const lifecycle = normalizeText(r.fasttrack_tier);
 
       const fasttrackTier = normalizeText(r.fasttrack_tier);
       const movingTo = normalizeText(r.moving_to);
